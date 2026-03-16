@@ -237,14 +237,14 @@ function normalizeQueueProductRow(product: any) {
   if (availableColors.length === 0) {
     availableColors = parsedVariants
       .map((variant: any): string => (isNonEmptyString(variant?.color) ? variant.color.trim() : ""))
-      .filter((value) => value.length > 0);
+      .filter((value: string) => value.length > 0);
   }
 
   let availableSizes = parseQueueStringArray(product?.available_sizes);
   if (availableSizes.length === 0) {
     availableSizes = parsedVariants
       .map((variant: any): string => (isNonEmptyString(variant?.size) ? variant.size.trim() : ""))
-      .filter((value) => value.length > 0);
+      .filter((value: string) => value.length > 0);
   }
 
   const displayName = pickDisplayName(product);
@@ -399,7 +399,7 @@ function mergeQueueProductWithPreview(baseProduct: any, previewProduct: any): an
   if (previewColors.length === 0) {
     previewColors = previewVariants
       .map((variant: any): string => (isNonEmptyString(variant?.color) ? variant.color.trim() : ""))
-      .filter((value) => value.length > 0);
+      .filter((value: string) => value.length > 0);
   }
   if (previewColors.length > 0 && parseQueueStringArray(merged?.available_colors).length === 0) {
     merged.available_colors = Array.from(new Set(previewColors));
@@ -409,7 +409,7 @@ function mergeQueueProductWithPreview(baseProduct: any, previewProduct: any): an
   if (previewSizes.length === 0) {
     previewSizes = previewVariants
       .map((variant: any): string => (isNonEmptyString(variant?.size) ? variant.size.trim() : ""))
-      .filter((value) => value.length > 0);
+      .filter((value: string) => value.length > 0);
   }
   if (previewSizes.length > 0 && parseQueueStringArray(merged?.available_sizes).length === 0) {
     merged.available_sizes = Array.from(new Set(previewSizes));
