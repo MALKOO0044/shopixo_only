@@ -28,12 +28,16 @@ type QueueProduct = {
   cj_product_id: string;
   store_sku?: string | null;
   product_code?: string | null;
-  name_en: string;
-  name_ar: string | null;
-  category: string;
-  images: string[];
-  variants: any[];
-  cj_price_usd: number;
+  name_en?: string | null;
+  name_ar?: string | null;
+  name?: string | null;
+  category?: string | null;
+  category_name?: string | null;
+  display_name?: string | null;
+  display_category?: string | null;
+  images?: unknown;
+  variants?: unknown;
+  cj_price_usd?: number | null;
   shipping_cost_usd: number | null;
   calculated_retail_sar: number | null;
   profit_margin?: number | null;
@@ -41,15 +45,15 @@ type QueueProduct = {
   rating_confidence?: number | null;
   supplier_rating?: number | null;
   review_count?: number | null;
-  stock_total: number;
+  stock_total?: number | null;
   quality_score: number;
   status: string;
   admin_notes: string | null;
   delivery_days_min: number;
   delivery_days_max: number;
   created_at: string;
-  available_colors?: string[];
-  available_sizes?: string[];
+  available_colors?: string[] | string | null;
+  available_sizes?: string[] | string | null;
   variant_pricing?: any[] | string | null;
   video_url?: string | null;
   video_source_url?: string | null;
@@ -61,17 +65,84 @@ type QueueProduct = {
   has_video?: boolean | null;
 };
 
-function parseQueueVariantPricing(value: QueueProduct["variant_pricing"]): any[] {
-  if (Array.isArray(value)) return value;
-  if (typeof value === "string") {
+function parseQueueJsonMaybe(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  const trimmed = value.trim();
+  if (!trimmed) return value;
+  if (
+    (trimmed.startsWith("[") && trimmed.endsWith("]")) ||
+    (trimmed.startsWith("{") && trimmed.endsWith("}"))
+  ) {
     try {
-      const parsed = JSON.parse(value);
-      return Array.isArray(parsed) ? parsed : [];
+      return JSON.parse(trimmed);
     } catch {
-      return [];
+      return value;
     }
   }
+  return value;
+}
+
+function parseQueueStringArray(value: unknown): string[] {
+  const parsed = parseQueueJsonMaybe(value);
+  if (Array.isArray(parsed)) {
+    return parsed
+      .map((item) => (typeof item === "string" ? item.trim() : ""))
+      .filter((item) => item.length > 0);
+  }
+  if (typeof parsed === "string") {
+    if (!parsed.includes(",")) return parsed.trim() ? [parsed.trim()] : [];
+    return parsed
+      .split(",")
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0);
+  }
   return [];
+}
+
+function parseQueueVariants(value: QueueProduct["variants"]): any[] {
+  const parsed = parseQueueJsonMaybe(value);
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+function parseQueueImages(value: QueueProduct["images"]): string[] {
+  const parsed = parseQueueJsonMaybe(value);
+  if (Array.isArray(parsed)) {
+    return parsed.filter((item): item is string => typeof item === "string" && /^https?:\/\//i.test(item));
+  }
+  if (typeof parsed === "string" && /^https?:\/\//i.test(parsed.trim())) {
+    return [parsed.trim()];
+  }
+  return [];
+}
+
+function parseQueueVariantPricing(value: QueueProduct["variant_pricing"]): any[] {
+  const parsed = parseQueueJsonMaybe(value);
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+function resolveQueueDisplayName(product: QueueProduct): string {
+  const direct = [product.display_name, product.name_en, product.name]
+    .find((value) => typeof value === "string" && value.trim().length > 0);
+  if (direct) return direct.trim();
+  const suffix = String(product.cj_product_id || "").slice(-10);
+  return suffix ? `CJ Product ${suffix}` : "CJ Product";
+}
+
+function resolveQueueDisplayCategory(product: QueueProduct): string {
+  const direct = [product.display_category, product.category_name, product.category]
+    .find((value) => typeof value === "string" && value.trim().length > 0);
+  return direct ? direct.trim() : "General";
+}
+
+function resolveQueueImages(product: QueueProduct): string[] {
+  const direct = parseQueueImages(product.images);
+  if (direct.length > 0) return direct;
+
+  const variants = parseQueueVariants(product.variants);
+  const fromVariants = variants
+    .map((variant) => variant?.variantImage || variant?.colorImage || variant?.image)
+    .filter((value): value is string => typeof value === "string" && /^https?:\/\//i.test(value));
+  return fromVariants;
 }
 
 function resolveQueueDisplayPriceUsd(product: QueueProduct): number | null {
@@ -97,7 +168,46 @@ function resolveQueueDisplayPriceUsd(product: QueueProduct): number | null {
     return sarToUsd(Math.min(...variantRetailPrices));
   }
 
+  const variantCostPrices = parseQueueVariants(product.variants)
+    .map((v: any) => Number(v?.variantPriceUSD ?? v?.variantPrice ?? v?.costPrice ?? v?.price))
+    .filter((p: number) => Number.isFinite(p) && p > 0);
+  if (variantCostPrices.length > 0) {
+    return Math.min(...variantCostPrices);
+  }
+
   return null;
+}
+
+function resolveQueueBaseCostUsd(product: QueueProduct): number {
+  const direct = Number(product.cj_price_usd);
+  if (Number.isFinite(direct) && direct > 0) return direct;
+
+  const variantPricing = parseQueueVariantPricing(product.variant_pricing);
+  const pricingCandidates = variantPricing
+    .map((v: any) => Number(v?.costPrice ?? v?.variantPriceUSD ?? v?.variantPrice ?? v?.cost))
+    .filter((p: number) => Number.isFinite(p) && p > 0);
+  if (pricingCandidates.length > 0) return Math.min(...pricingCandidates);
+
+  const variantCandidates = parseQueueVariants(product.variants)
+    .map((v: any) => Number(v?.variantPriceUSD ?? v?.variantPrice ?? v?.costPrice ?? v?.price))
+    .filter((p: number) => Number.isFinite(p) && p > 0);
+  if (variantCandidates.length > 0) return Math.min(...variantCandidates);
+
+  return 0;
+}
+
+function resolveQueueStockTotal(product: QueueProduct): number {
+  const direct = Number(product.stock_total);
+  if (Number.isFinite(direct) && direct >= 0) return Math.floor(direct);
+
+  const fromVariants = parseQueueVariants(product.variants)
+    .map((v: any) =>
+      Number(v?.stock ?? v?.totalStock ?? (Number(v?.cjStock || 0) + Number(v?.factoryStock || 0)))
+    )
+    .filter((value: number) => Number.isFinite(value) && value >= 0);
+
+  if (fromVariants.length === 0) return 0;
+  return Math.floor(fromVariants.reduce((sum, value) => sum + value, 0));
 }
 
 function resolveQueueMarginPercent(product: QueueProduct): number | null {
@@ -479,9 +589,9 @@ export default function QueuePage() {
   const startEdit = (product: QueueProduct) => {
     setEditingId(product.id);
     setEditData({
-      name_en: product.name_en,
+      name_en: resolveQueueDisplayName(product),
       name_ar: product.name_ar || "",
-      category: product.category,
+      category: resolveQueueDisplayCategory(product),
       admin_notes: product.admin_notes || "",
     });
   };
@@ -532,12 +642,12 @@ export default function QueuePage() {
       p.id,
       resolveQueueStoreSku(p),
       p.cj_product_id,
-      `"${p.name_en.replace(/"/g, '""')}"`,
-      p.category,
+      `"${resolveQueueDisplayName(p).replace(/"/g, '""')}"`,
+      resolveQueueDisplayCategory(p),
       resolveQueueDisplayPriceUsd(p)?.toFixed(2) ?? "",
-      p.cj_price_usd,
+      resolveQueueBaseCostUsd(p).toFixed(2),
       resolveQueueMarginPercent(p)?.toFixed(1) ?? "",
-      p.stock_total,
+      resolveQueueStockTotal(p),
       resolveQueueDisplayedRating(p).toFixed(1),
       resolveQueueReviewCount(p),
       p.status,
@@ -837,6 +947,14 @@ export default function QueuePage() {
                 const displayMarginPercent = resolveQueueMarginPercent(product);
                 const displayStoreSku = resolveQueueStoreSku(product);
                 const queueVideoUrl = getQueueVideoUrl(product);
+                const displayName = resolveQueueDisplayName(product);
+                const displayCategory = resolveQueueDisplayCategory(product);
+                const displayImages = resolveQueueImages(product);
+                const displayBaseCostUsd = resolveQueueBaseCostUsd(product);
+                const displayStockTotal = resolveQueueStockTotal(product);
+                const displayColors = parseQueueStringArray(product.available_colors);
+                const displaySizes = parseQueueStringArray(product.available_sizes);
+                const displayVariants = parseQueueVariants(product.variants);
 
                 return editingId === product.id ? (
                   <tr key={product.id} className="bg-blue-50">
@@ -934,10 +1052,10 @@ export default function QueuePage() {
                     </td>
                     <td className="px-4 py-3">
                       <div className="relative w-14 h-14 rounded-lg overflow-hidden bg-gray-100">
-                        {product.images[0] ? (
+                        {displayImages[0] ? (
                           <SmartImage
-                            src={enhanceProductImageUrl(product.images[0], "card")}
-                            alt={product.name_en}
+                            src={enhanceProductImageUrl(displayImages[0], "card")}
+                            alt={displayName}
                             fill
                             quality={95}
                             sizes="56px"
@@ -964,7 +1082,7 @@ export default function QueuePage() {
                       </div>
                     </td>
                     <td className="px-4 py-3">
-                      <p className="font-medium text-gray-900 line-clamp-2">{product.name_en}</p>
+                      <p className="font-medium text-gray-900 line-clamp-2">{displayName}</p>
                       {hasQueueVideo(product) && (
                         <div className="space-y-0.5">
                           <span className="inline-flex items-center gap-1 text-[11px] text-blue-700">
@@ -990,40 +1108,40 @@ export default function QueuePage() {
                       </span>
                     </td>
                     <td className="px-4 py-3">
-                      <span className="px-2 py-1 bg-gray-100 rounded text-xs text-gray-700">{product.category}</span>
+                      <span className="px-2 py-1 bg-gray-100 rounded text-xs text-gray-700">{displayCategory}</span>
                     </td>
                     <td className="px-4 py-3">
                       <p className="font-medium text-green-600">
                         {displayRetailUsd !== null ? `$${displayRetailUsd.toFixed(2)} USD` : "$-"}
                       </p>
-                      <p className="text-xs text-gray-500">Base Cost: ${product.cj_price_usd?.toFixed(2) || "0.00"}</p>
+                      <p className="text-xs text-gray-500">Base Cost: ${displayBaseCostUsd.toFixed(2)}</p>
                       {displayMarginPercent !== null && (
                         <p className="text-xs text-emerald-600">Margin: {displayMarginPercent.toFixed(1)}%</p>
                       )}
-                      <p className="text-xs text-gray-500">Stock: {product.stock_total}</p>
+                      <p className="text-xs text-gray-500">Stock: {displayStockTotal}</p>
                     </td>
                     <td className="px-4 py-3">
                       <div className="space-y-1">
-                        {product.available_colors && product.available_colors.length > 0 && (
+                        {displayColors.length > 0 && (
                           <div className="flex items-center gap-1 flex-wrap">
                             <span className="text-xs text-gray-500">Colors:</span>
-                            <span className="text-xs font-medium text-gray-700">{product.available_colors.length}</span>
-                            <span className="text-xs text-gray-400 truncate max-w-[120px]" title={product.available_colors.join(', ')}>
-                              ({product.available_colors.slice(0, 3).join(', ')}{product.available_colors.length > 3 ? '...' : ''})
+                            <span className="text-xs font-medium text-gray-700">{displayColors.length}</span>
+                            <span className="text-xs text-gray-400 truncate max-w-[120px]" title={displayColors.join(', ')}>
+                              ({displayColors.slice(0, 3).join(', ')}{displayColors.length > 3 ? '...' : ''})
                             </span>
                           </div>
                         )}
-                        {product.available_sizes && product.available_sizes.length > 0 && (
+                        {displaySizes.length > 0 && (
                           <div className="flex items-center gap-1 flex-wrap">
                             <span className="text-xs text-gray-500">Sizes:</span>
-                            <span className="text-xs font-medium text-gray-700">{product.available_sizes.length}</span>
-                            <span className="text-xs text-gray-400 truncate max-w-[120px]" title={product.available_sizes.join(', ')}>
-                              ({product.available_sizes.slice(0, 4).join(', ')}{product.available_sizes.length > 4 ? '...' : ''})
+                            <span className="text-xs font-medium text-gray-700">{displaySizes.length}</span>
+                            <span className="text-xs text-gray-400 truncate max-w-[120px]" title={displaySizes.join(', ')}>
+                              ({displaySizes.slice(0, 4).join(', ')}{displaySizes.length > 4 ? '...' : ''})
                             </span>
                           </div>
                         )}
-                        {(!product.available_colors || product.available_colors.length === 0) && (!product.available_sizes || product.available_sizes.length === 0) && (
-                          <span className="text-xs text-gray-400">{product.variants?.length || 0} variants</span>
+                        {displayColors.length === 0 && displaySizes.length === 0 && (
+                          <span className="text-xs text-gray-400">{displayVariants.length || 0} variants</span>
                         )}
                       </div>
                     </td>
