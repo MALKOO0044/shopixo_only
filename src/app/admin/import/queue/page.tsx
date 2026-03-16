@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import Link from "next/link";
 import {
   CheckCircle,
@@ -86,15 +86,15 @@ function parseQueueStringArray(value: unknown): string[] {
   const parsed = parseQueueJsonMaybe(value);
   if (Array.isArray(parsed)) {
     return parsed
-      .map((item) => (typeof item === "string" ? item.trim() : ""))
-      .filter((item) => item.length > 0);
+      .map((item: unknown): string => (typeof item === "string" ? item.trim() : ""))
+      .filter((item: string) => item.length > 0);
   }
   if (typeof parsed === "string") {
     if (!parsed.includes(",")) return parsed.trim() ? [parsed.trim()] : [];
     return parsed
       .split(",")
-      .map((item) => item.trim())
-      .filter((item) => item.length > 0);
+      .map((item: string): string => item.trim())
+      .filter((item: string) => item.length > 0);
   }
   return [];
 }
@@ -306,6 +306,19 @@ type Stats = {
   imported: number;
 };
 
+type QueueBackfillProgress = {
+  running: boolean;
+  done: boolean;
+  scanned: number;
+  stale: number;
+  updated: number;
+  persisted: number;
+  previewMisses: number;
+  persistFailures: number;
+  cursor: number | null;
+  error: string | null;
+};
+
 type SchemaRemediation = {
   ready: boolean;
   missingColumns: string[];
@@ -353,6 +366,23 @@ export default function QueuePage() {
   const [actionLoading, setActionLoading] = useState(false);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editData, setEditData] = useState<Partial<QueueProduct>>({});
+  const [backfillProgress, setBackfillProgress] = useState<QueueBackfillProgress>({
+    running: false,
+    done: false,
+    scanned: 0,
+    stale: 0,
+    updated: 0,
+    persisted: 0,
+    previewMisses: 0,
+    persistFailures: 0,
+    cursor: null,
+    error: null,
+  });
+  const backfillInFlightRef = useRef(false);
+  const backfillDoneRef = useRef(false);
+  const backfillCursorRef = useRef<number | null>(null);
+  const backfillTimerRef = useRef<number | null>(null);
+  const backfillErrorCountRef = useRef(0);
 
   const fetchProducts = useCallback(async () => {
     setLoading(true);
@@ -383,9 +413,117 @@ export default function QueuePage() {
     }
   }, [statusFilter, categoryFilter, page]);
 
+  const runGlobalQueueBackfill = useCallback(async () => {
+    if (backfillInFlightRef.current || backfillDoneRef.current) return;
+
+    let shouldRefreshProducts = false;
+    backfillInFlightRef.current = true;
+    setBackfillProgress((prev) => ({ ...prev, running: true, error: null }));
+
+    try {
+      let loops = 0;
+      while (loops < 8 && !backfillDoneRef.current) {
+        const res = await fetch("/api/admin/import/queue", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "backfill",
+            status: "all",
+            cursor: backfillCursorRef.current,
+            chunkSize: 6,
+            concurrency: 3,
+          }),
+        });
+
+        const data = await res.json();
+        if (!res.ok || !data?.ok) {
+          throw new Error(data?.error || "Queue backfill request failed");
+        }
+
+        const nextCursor = typeof data.nextCursor === "number" ? data.nextCursor : null;
+        const done = Boolean(data.done);
+        const scanned = Number.isFinite(Number(data.scanned)) ? Number(data.scanned) : 0;
+        const stale = Number.isFinite(Number(data.stale)) ? Number(data.stale) : 0;
+        const updated = Number.isFinite(Number(data.updated)) ? Number(data.updated) : 0;
+        const persisted = Number.isFinite(Number(data.persisted)) ? Number(data.persisted) : 0;
+        const previewMisses = Number.isFinite(Number(data.previewMisses)) ? Number(data.previewMisses) : 0;
+        const persistFailures = Number.isFinite(Number(data.persistFailures)) ? Number(data.persistFailures) : 0;
+
+        if (updated > 0 || persisted > 0) {
+          shouldRefreshProducts = true;
+        }
+
+        backfillCursorRef.current = nextCursor;
+        backfillDoneRef.current = done;
+        backfillErrorCountRef.current = 0;
+
+        setBackfillProgress((prev) => ({
+          ...prev,
+          running: true,
+          done,
+          cursor: nextCursor,
+          scanned: prev.scanned + scanned,
+          stale: prev.stale + stale,
+          updated: prev.updated + updated,
+          persisted: prev.persisted + persisted,
+          previewMisses: prev.previewMisses + previewMisses,
+          persistFailures: prev.persistFailures + persistFailures,
+          error: null,
+        }));
+
+        loops += 1;
+        if (done) break;
+      }
+    } catch (e: any) {
+      backfillErrorCountRef.current += 1;
+      setBackfillProgress((prev) => ({
+        ...prev,
+        error: e?.message || "Queue backfill failed",
+      }));
+    } finally {
+      backfillInFlightRef.current = false;
+      setBackfillProgress((prev) => ({
+        ...prev,
+        running: false,
+        done: backfillDoneRef.current || prev.done,
+      }));
+
+      if (shouldRefreshProducts) {
+        fetchProducts();
+      }
+
+      if (!backfillDoneRef.current && backfillErrorCountRef.current < 3) {
+        if (backfillTimerRef.current != null) {
+          window.clearTimeout(backfillTimerRef.current);
+        }
+        backfillTimerRef.current = window.setTimeout(() => {
+          backfillTimerRef.current = null;
+          void runGlobalQueueBackfill();
+        }, 700);
+      }
+    }
+  }, [fetchProducts]);
+
   useEffect(() => {
     fetchProducts();
   }, [fetchProducts]);
+
+  useEffect(() => {
+    if (backfillDoneRef.current || backfillInFlightRef.current) return;
+    if (backfillTimerRef.current != null) return;
+
+    backfillTimerRef.current = window.setTimeout(() => {
+      backfillTimerRef.current = null;
+      void runGlobalQueueBackfill();
+    }, 300);
+
+    return () => {
+      if (backfillTimerRef.current != null) {
+        window.clearTimeout(backfillTimerRef.current);
+        backfillTimerRef.current = null;
+      }
+    };
+  }, [runGlobalQueueBackfill]);
 
   useEffect(() => {
     async function fetchLocalCategories() {
@@ -793,6 +931,33 @@ export default function QueuePage() {
         </div>
       )}
 
+      <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-xs text-blue-900">
+        <div className="flex items-center justify-between gap-2">
+          <span className="font-medium">
+            Queue preview sync: {backfillProgress.done ? "completed" : backfillProgress.running ? "running" : "in progress"}
+          </span>
+          {!backfillProgress.done && !backfillProgress.running && (
+            <button
+              onClick={() => void runGlobalQueueBackfill()}
+              className="px-2 py-1 border border-blue-300 rounded bg-white hover:bg-blue-100 text-blue-800"
+            >
+              Resume
+            </button>
+          )}
+        </div>
+        <p className="mt-1">
+          Scanned: {backfillProgress.scanned.toLocaleString()} · Stale: {backfillProgress.stale.toLocaleString()} · Updated: {backfillProgress.updated.toLocaleString()} · Persisted: {backfillProgress.persisted.toLocaleString()}
+        </p>
+        {(backfillProgress.previewMisses > 0 || backfillProgress.persistFailures > 0) && (
+          <p className="mt-1 text-blue-800">
+            Preview misses: {backfillProgress.previewMisses.toLocaleString()} · Persist failures: {backfillProgress.persistFailures.toLocaleString()}
+          </p>
+        )}
+        {backfillProgress.error && (
+          <p className="mt-1 text-red-700">{backfillProgress.error}</p>
+        )}
+      </div>
+
       {schemaRemediation && (
         <div className="rounded-lg border border-amber-300 bg-amber-50 p-4 space-y-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
@@ -832,7 +997,7 @@ export default function QueuePage() {
 
           {schemaRemediation.instructions.length > 0 && (
             <ol className="list-decimal list-inside space-y-1 text-xs text-amber-900">
-              {schemaRemediation.instructions.map((step, index) => (
+              {schemaRemediation.instructions.map((step: string, index: number) => (
                 <li key={`${step}-${index}`}>{step}</li>
               ))}
             </ol>

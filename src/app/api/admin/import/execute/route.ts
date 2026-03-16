@@ -583,6 +583,457 @@ function findFidelityMismatches(
   return mismatches;
 }
 
+const IMPORT_PLACEHOLDER_QUEUE_CATEGORY_TOKENS = new Set([
+  'general',
+  'uncategorized',
+  'unknown',
+  'misc',
+  'others',
+]);
+
+function isNonEmptyImportString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function parseImportQueueStringArray(value: unknown): string[] {
+  const parsed = parseJsonMaybe(value);
+  if (Array.isArray(parsed)) {
+    return parsed
+      .map((item: unknown): string => (typeof item === 'string' ? item.trim() : ''))
+      .filter((item: string) => item.length > 0);
+  }
+  if (typeof parsed === 'string') {
+    const trimmed = parsed.trim();
+    if (!trimmed) return [];
+    if (!trimmed.includes(',')) return [trimmed];
+    return trimmed
+      .split(',')
+      .map((item: string): string => item.trim())
+      .filter((item: string) => item.length > 0);
+  }
+  return [];
+}
+
+function normalizeImportHttpUrl(value: unknown): string | null {
+  if (!isNonEmptyImportString(value)) return null;
+  const trimmed = value.trim();
+  if (trimmed.startsWith('//')) return `https:${trimmed}`;
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  return null;
+}
+
+function extractImportImageCandidates(input: unknown): unknown[] {
+  const parsed = parseJsonMaybe(input);
+  if (Array.isArray(parsed)) return parsed;
+  if (parsed && typeof parsed === 'object') return Object.values(parsed as Record<string, unknown>);
+  if (parsed == null) return [];
+  return [parsed];
+}
+
+function normalizeImportQueueImages(value: unknown): string[] {
+  const source = extractImportImageCandidates(value);
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const objectImageKeys = ['url', 'image', 'img', 'src', 'imageUrl', 'mainImage', 'thumbnail'];
+
+  const pushCandidate = (candidate: unknown) => {
+    const normalized = normalizeImportHttpUrl(candidate);
+    if (!normalized) return;
+    const enhanced = enhanceProductImageUrl(normalized, 'gallery');
+    const key = normalizeCjImageKey(enhanced) || enhanced.toLowerCase();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push(enhanced);
+  };
+
+  for (const item of source) {
+    if (typeof item === 'string') {
+      pushCandidate(item);
+      continue;
+    }
+    if (item && typeof item === 'object') {
+      const record = item as Record<string, unknown>;
+      for (const key of objectImageKeys) {
+        if (record[key] !== undefined) pushCandidate(record[key]);
+      }
+    }
+  }
+
+  return out;
+}
+
+function isPlaceholderImportQueueName(value: unknown): boolean {
+  if (!isNonEmptyImportString(value)) return true;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return true;
+  if (/^cj product\b/.test(normalized)) return true;
+  if (/^unavailable cj product\b/.test(normalized)) return true;
+  if (/^unknown product\b/.test(normalized)) return true;
+  return false;
+}
+
+function isPlaceholderImportQueueCategory(value: unknown): boolean {
+  if (!isNonEmptyImportString(value)) return true;
+  const normalized = value.trim().toLowerCase();
+  return IMPORT_PLACEHOLDER_QUEUE_CATEGORY_TOKENS.has(normalized);
+}
+
+function hasMeaningfulImportVariantData(variants: any[]): boolean {
+  return variants.some((variant: any) => {
+    if (!variant || typeof variant !== 'object') return false;
+    if (isNonEmptyImportString(variant?.color) || isNonEmptyImportString(variant?.size)) return true;
+    const stock = Number(
+      variant?.stock ??
+        variant?.totalStock ??
+        (Number(variant?.cjStock || 0) + Number(variant?.factoryStock || 0))
+    );
+    if (Number.isFinite(stock) && stock > 0) return true;
+    const cost = Number(variant?.variantPriceUSD ?? variant?.variantPrice ?? variant?.costPrice ?? variant?.price);
+    return Number.isFinite(cost) && cost > 0;
+  });
+}
+
+function deriveImportQueueBaseCostUsd(product: any, variantPricing: any[], variants: any[]): number {
+  const direct = Number(product?.cj_price_usd);
+  if (Number.isFinite(direct) && direct > 0) return direct;
+
+  const pricingCandidates = variantPricing
+    .map((row: any) => Number(row?.costPrice ?? row?.variantPriceUSD ?? row?.variantPrice ?? row?.cost))
+    .filter((value: number) => Number.isFinite(value) && value > 0);
+  if (pricingCandidates.length > 0) return Math.min(...pricingCandidates);
+
+  const variantCandidates = variants
+    .map((variant: any) => Number(variant?.variantPriceUSD ?? variant?.variantPrice ?? variant?.costPrice ?? variant?.price))
+    .filter((value: number) => Number.isFinite(value) && value > 0);
+  if (variantCandidates.length > 0) return Math.min(...variantCandidates);
+
+  return 0;
+}
+
+function deriveImportQueueStockTotal(product: any, variants: any[]): number {
+  const direct = Number(product?.stock_total);
+  if (Number.isFinite(direct) && direct >= 0) return Math.floor(direct);
+
+  const fromVariants = variants
+    .map((variant: any) =>
+      Number(
+        variant?.stock ??
+          variant?.totalStock ??
+          (Number(variant?.cjStock || 0) + Number(variant?.factoryStock || 0))
+      )
+    )
+    .filter((value: number) => Number.isFinite(value) && value >= 0);
+
+  if (fromVariants.length === 0) return 0;
+  return Math.floor(fromVariants.reduce((sum, value) => sum + value, 0));
+}
+
+function isQueueRowLikelyStaleForImport(product: any): boolean {
+  const displayName = String(product?.name_en || product?.display_name || '').trim();
+  const displayCategory = String(product?.category_name || product?.category || product?.display_category || '').trim();
+  const images = normalizeImportQueueImages(product?.images);
+  const variants = parseArrayOrEmpty(product?.variants);
+  const variantPricing = parseArrayOrEmpty(product?.variant_pricing);
+  const colors = parseImportQueueStringArray(product?.available_colors);
+  const sizes = parseImportQueueStringArray(product?.available_sizes);
+  const baseCost = deriveImportQueueBaseCostUsd(product, variantPricing, variants);
+  const stockTotal = deriveImportQueueStockTotal(product, variants);
+  const rating = normalizeImportedRatingValue(product?.displayed_rating) ?? normalizeImportedRatingValue(product?.supplier_rating);
+  const reviewCount = normalizeImportedReviewCount(product?.review_count) ?? 0;
+
+  let staleSignals = 0;
+  if (isPlaceholderImportQueueName(displayName)) staleSignals += 2;
+  if (images.length === 0) staleSignals += 2;
+  if (isPlaceholderImportQueueCategory(displayCategory)) staleSignals += 1;
+  if (baseCost <= 0) staleSignals += 1;
+  if (stockTotal <= 0 && !hasMeaningfulImportVariantData(variants)) staleSignals += 1;
+  if (colors.length === 0 && sizes.length === 0 && variants.length <= 1) staleSignals += 1;
+  if (rating == null && reviewCount <= 0) staleSignals += 1;
+  return staleSignals >= 2;
+}
+
+function buildImportVariantPricingFromPreviewVariants(variants: any[]): any[] {
+  if (!Array.isArray(variants) || variants.length === 0) return [];
+  return variants.map((variant: any, index: number) => {
+    const color = isNonEmptyImportString(variant?.color) ? variant.color.trim() : '';
+    const size = isNonEmptyImportString(variant?.size) ? variant.size.trim() : '';
+    const variantId =
+      (isNonEmptyImportString(variant?.variantId) && variant.variantId.trim()) ||
+      (isNonEmptyImportString(variant?.vid) && variant.vid.trim()) ||
+      `${index + 1}`;
+    const variantSku =
+      (isNonEmptyImportString(variant?.variantSku) && variant.variantSku.trim()) ||
+      (isNonEmptyImportString(variant?.sku) && variant.sku.trim()) ||
+      variantId;
+    const variantImage =
+      normalizeImportHttpUrl(variant?.variantImage) ||
+      normalizeImportHttpUrl(variant?.colorImage) ||
+      normalizeImportHttpUrl(variant?.image) ||
+      null;
+    const sellPriceSAR = toPositiveNumberOrNull(variant?.sellPriceSAR ?? variant?.price ?? variant?.sellPriceSar);
+    const sellPriceUSD = toPositiveNumberOrNull(variant?.sellPriceUSD ?? variant?.sellPriceUsd ?? variant?.priceUsd);
+    const costPrice = toPositiveNumberOrNull(variant?.variantPriceUSD ?? variant?.variantPrice ?? variant?.costPrice);
+    const shippingCost = toPositiveNumberOrNull(variant?.shippingPriceUSD ?? variant?.shippingCost ?? variant?.shippingPrice);
+    const stockRaw = Number(
+      variant?.stock ??
+        variant?.totalStock ??
+        (Number(variant?.cjStock || 0) + Number(variant?.factoryStock || 0))
+    );
+    const stock = Number.isFinite(stockRaw) && stockRaw > 0 ? Math.floor(stockRaw) : 0;
+
+    return {
+      variantId,
+      sku: variantSku,
+      color: color || undefined,
+      size: size || undefined,
+      colorImage: variantImage || undefined,
+      price: sellPriceSAR ?? undefined,
+      priceUsd: sellPriceUSD ?? undefined,
+      marginPercent: toPositiveNumberOrNull(variant?.marginPercent ?? variant?.profitMargin ?? variant?.margin) ?? undefined,
+      costPrice: costPrice ?? undefined,
+      shippingCost: shippingCost ?? undefined,
+      stock,
+      cjStock: Math.max(0, Math.floor(Number(variant?.cjStock || stock))),
+      factoryStock: Math.max(0, Math.floor(Number(variant?.factoryStock || 0))),
+    };
+  });
+}
+
+function deriveImportPreviewBaseCostUsd(previewProduct: any, previewVariantPricing: any[], previewVariants: any[]): number {
+  const directCandidates = previewVariants
+    .map((variant: any) => toPositiveNumberOrNull(variant?.variantPriceUSD ?? variant?.variantPrice ?? variant?.costPrice ?? variant?.priceUSD))
+    .filter((value: number | null): value is number => typeof value === 'number');
+  if (directCandidates.length > 0) return Math.min(...directCandidates);
+
+  const pricingCandidates = previewVariantPricing
+    .map((variant: any) => toPositiveNumberOrNull(variant?.costPrice ?? variant?.variantPriceUSD ?? variant?.variantPrice ?? variant?.cost))
+    .filter((value: number | null): value is number => typeof value === 'number');
+  if (pricingCandidates.length > 0) return Math.min(...pricingCandidates);
+
+  const minPriceUSD = toPositiveNumberOrNull(previewProduct?.minPriceUSD);
+  return minPriceUSD ?? 0;
+}
+
+function mergeQueueImportRowWithPreview(baseProduct: any, previewProduct: any): any {
+  if (!previewProduct || typeof previewProduct !== 'object') return baseProduct;
+
+  const merged = { ...baseProduct };
+  const previewName = isNonEmptyImportString(previewProduct?.name) ? previewProduct.name.trim() : '';
+  if (previewName && (isPlaceholderImportQueueName(merged?.name_en) || !isNonEmptyImportString(merged?.name_en))) {
+    merged.name_en = previewName;
+  }
+
+  const previewCategory = isNonEmptyImportString(previewProduct?.categoryName) ? previewProduct.categoryName.trim() : '';
+  if (previewCategory) {
+    if (!isNonEmptyImportString(merged?.category_name) || isPlaceholderImportQueueCategory(merged?.category_name)) {
+      merged.category_name = previewCategory;
+    }
+    if (!isNonEmptyImportString(merged?.category) || isPlaceholderImportQueueCategory(merged?.category)) {
+      merged.category = previewCategory;
+    }
+  }
+
+  const previewImages = normalizeImportQueueImages(previewProduct?.images);
+  if (previewImages.length > 0 && normalizeImportQueueImages(merged?.images).length === 0) {
+    merged.images = previewImages;
+  }
+
+  const previewVariants = Array.isArray(previewProduct?.variants) ? previewProduct.variants : [];
+  if (previewVariants.length > 0) {
+    const currentVariants = parseArrayOrEmpty(merged?.variants);
+    if (currentVariants.length === 0 || !hasMeaningfulImportVariantData(currentVariants)) {
+      merged.variants = previewVariants;
+    }
+  }
+
+  const previewVariantPricing = buildImportVariantPricingFromPreviewVariants(previewVariants);
+  if (previewVariantPricing.length > 0 && parseArrayOrEmpty(merged?.variant_pricing).length === 0) {
+    merged.variant_pricing = previewVariantPricing;
+  }
+
+  let previewColors = parseImportQueueStringArray(previewProduct?.availableColors);
+  if (previewColors.length === 0) {
+    previewColors = previewVariants
+      .map((variant: any): string => (isNonEmptyImportString(variant?.color) ? variant.color.trim() : ''))
+      .filter((value: string) => value.length > 0);
+  }
+  if (previewColors.length > 0 && parseImportQueueStringArray(merged?.available_colors).length === 0) {
+    merged.available_colors = Array.from(new Set(previewColors));
+  }
+
+  let previewSizes = parseImportQueueStringArray(previewProduct?.availableSizes);
+  if (previewSizes.length === 0) {
+    previewSizes = previewVariants
+      .map((variant: any): string => (isNonEmptyImportString(variant?.size) ? variant.size.trim() : ''))
+      .filter((value: string) => value.length > 0);
+  }
+  if (previewSizes.length > 0 && parseImportQueueStringArray(merged?.available_sizes).length === 0) {
+    merged.available_sizes = Array.from(new Set(previewSizes));
+  }
+
+  const previewBaseCostUsd = deriveImportPreviewBaseCostUsd(previewProduct, previewVariantPricing, previewVariants);
+  if (toPositiveNumberOrNull(merged?.cj_price_usd) == null && previewBaseCostUsd > 0) {
+    merged.cj_price_usd = previewBaseCostUsd;
+  }
+
+  const previewStockRaw = Number(previewProduct?.stock);
+  const previewStock = Number.isFinite(previewStockRaw) ? Math.max(0, Math.floor(previewStockRaw)) : 0;
+  const currentStockRaw = Number(merged?.stock_total);
+  const currentStock = Number.isFinite(currentStockRaw) ? currentStockRaw : 0;
+  if (currentStock <= 0 && previewStock > 0) {
+    merged.stock_total = previewStock;
+  }
+
+  const previewDisplayedRating = normalizeImportedRatingValue(previewProduct?.displayedRating);
+  if (normalizeImportedRatingValue(merged?.displayed_rating) == null && previewDisplayedRating != null) {
+    merged.displayed_rating = previewDisplayedRating;
+  }
+
+  const previewSupplierRating = normalizeImportedRatingValue(previewProduct?.rating);
+  if (normalizeImportedRatingValue(merged?.supplier_rating) == null && previewSupplierRating != null) {
+    merged.supplier_rating = previewSupplierRating;
+  }
+
+  const previewReviewCount = normalizeImportedReviewCount(previewProduct?.reviewCount) ?? 0;
+  const currentReviewCount = normalizeImportedReviewCount(merged?.review_count) ?? 0;
+  if (currentReviewCount <= 0 && previewReviewCount > 0) {
+    merged.review_count = previewReviewCount;
+  }
+
+  const previewRatingConfidence = normalizeImportedRatingConfidence(previewProduct?.ratingConfidence);
+  if (normalizeImportedRatingConfidence(merged?.rating_confidence) == null && previewRatingConfidence != null) {
+    merged.rating_confidence = previewRatingConfidence;
+  }
+
+  if (!isNonEmptyImportString(merged?.store_sku) && isNonEmptyImportString(previewProduct?.storeSku)) {
+    merged.store_sku = previewProduct.storeSku.trim();
+  }
+  if (!isNonEmptyImportString(merged?.cj_sku) && isNonEmptyImportString(previewProduct?.cjSku)) {
+    merged.cj_sku = previewProduct.cjSku.trim();
+  }
+
+  return merged;
+}
+
+function valuesEqualForQueueSync(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (typeof left === 'number' && typeof right === 'number') {
+    return Number.isFinite(left) && Number.isFinite(right) && Math.abs(left - right) < 0.0001;
+  }
+  try {
+    return JSON.stringify(left) === JSON.stringify(right);
+  } catch {
+    return String(left) === String(right);
+  }
+}
+
+function buildQueuePreviewSyncPatch(originalProduct: any, mergedProduct: any): Record<string, any> {
+  const patchableFields = [
+    'name_en',
+    'category',
+    'category_name',
+    'images',
+    'variants',
+    'variant_pricing',
+    'available_colors',
+    'available_sizes',
+    'cj_price_usd',
+    'stock_total',
+    'displayed_rating',
+    'supplier_rating',
+    'rating_confidence',
+    'review_count',
+    'store_sku',
+    'cj_sku',
+  ];
+  const patch: Record<string, any> = {};
+  for (const field of patchableFields) {
+    if (!valuesEqualForQueueSync(originalProduct?.[field], mergedProduct?.[field])) {
+      patch[field] = mergedProduct?.[field] ?? null;
+    }
+  }
+  return patch;
+}
+
+async function fetchPreviewProductForImport(req: NextRequest, pid: string): Promise<any | null> {
+  const normalizedPid = String(pid || '').trim();
+  if (!normalizedPid) return null;
+
+  let origin: string;
+  try {
+    origin = req.nextUrl?.origin || new URL(req.url).origin;
+  } catch {
+    return null;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 3500);
+  try {
+    const res = await fetch(
+      `${origin}/api/admin/cj/products/${encodeURIComponent(normalizedPid)}/details`,
+      {
+        method: 'GET',
+        cache: 'no-store',
+        signal: controller.signal,
+        headers: {
+          cookie: req.headers.get('cookie') || '',
+          'x-queue-enrich': '1',
+          'x-import-presync': '1',
+        },
+      }
+    );
+    if (!res.ok) return null;
+    const payload = await res.json();
+    if (!payload?.ok || !payload?.product) return null;
+    return payload.product;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function syncQueueRowForImport(req: NextRequest, admin: any, queueRow: any): Promise<any> {
+  if (!isQueueRowLikelyStaleForImport(queueRow)) return queueRow;
+
+  const pid = String(queueRow?.cj_product_id || '').trim();
+  if (!pid) return queueRow;
+
+  const previewProduct = await fetchPreviewProductForImport(req, pid);
+  if (!previewProduct) return queueRow;
+
+  const mergedProduct = mergeQueueImportRowWithPreview(queueRow, previewProduct);
+  const patch = buildQueuePreviewSyncPatch(queueRow, mergedProduct);
+  if (Object.keys(patch).length === 0) return mergedProduct;
+
+  const updatePayload = { ...patch, updated_at: new Date().toISOString() };
+  try {
+    let updateQuery = admin.from('product_queue').update(updatePayload);
+    const numericId = Number(queueRow?.id);
+    if (Number.isFinite(numericId) && numericId > 0) {
+      updateQuery = updateQuery.eq('id', numericId);
+    } else {
+      updateQuery = updateQuery.eq('cj_product_id', pid);
+    }
+    const { error } = await updateQuery;
+    if (error) {
+      console.warn('[Import Execute] Queue pre-sync persist warning:', {
+        id: queueRow?.id,
+        pid,
+        error: error.message,
+      });
+    }
+  } catch (persistError: any) {
+    console.warn('[Import Execute] Queue pre-sync persist exception:', {
+      id: queueRow?.id,
+      pid,
+      error: persistError?.message || String(persistError),
+    });
+  }
+
+  return mergedProduct;
+}
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
@@ -744,6 +1195,19 @@ export async function POST(req: NextRequest) {
 
     for (const qp of queueProducts) {
       try {
+        try {
+          const syncedQueueRow = await syncQueueRowForImport(req, admin, qp);
+          if (syncedQueueRow && typeof syncedQueueRow === 'object') {
+            Object.assign(qp, syncedQueueRow);
+          }
+        } catch (presyncError: any) {
+          console.warn('[Import Execute] Queue pre-sync warning:', {
+            id: qp?.id,
+            pid: qp?.cj_product_id,
+            error: presyncError?.message || String(presyncError),
+          });
+        }
+
         requireField(qp.cj_product_id, 'pid');
         const queueStoreSku = qp.store_sku || qp.product_code || null;
         requireField(queueStoreSku, 'storeSku');

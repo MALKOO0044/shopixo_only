@@ -54,15 +54,15 @@ function parseQueueStringArray(value: unknown): string[] {
   const parsed = parseJsonMaybe(value);
   if (Array.isArray(parsed)) {
     return parsed
-      .map((item) => (typeof item === "string" ? item.trim() : ""))
-      .filter((item) => item.length > 0);
+      .map((item: unknown): string => (typeof item === "string" ? item.trim() : ""))
+      .filter((item: string) => item.length > 0);
   }
   if (isNonEmptyString(parsed)) {
     if (!parsed.includes(",")) return [parsed.trim()];
     return parsed
       .split(",")
-      .map((item) => item.trim())
-      .filter((item) => item.length > 0);
+      .map((item: string): string => item.trim())
+      .filter((item: string) => item.length > 0);
   }
   return [];
 }
@@ -157,6 +157,9 @@ const PLACEHOLDER_QUEUE_CATEGORY_TOKENS = new Set([
   "misc",
   "others",
 ]);
+const QUEUE_STATUS_VALUES = ["all", "pending", "approved", "rejected", "imported"] as const;
+type QueueStatusFilter = (typeof QUEUE_STATUS_VALUES)[number];
+const QUEUE_STATUS_SET = new Set<string>(QUEUE_STATUS_VALUES);
 
 function toFiniteNumber(value: unknown, fallback = 0): number {
   const num = Number(value);
@@ -167,6 +170,35 @@ function toPositiveNumberOrNull(value: unknown): number | null {
   const num = Number(value);
   if (!Number.isFinite(num) || num <= 0) return null;
   return num;
+}
+
+function clampInteger(value: unknown, min: number, max: number, fallback: number): number {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(numeric)));
+}
+
+function parsePositiveIntegerOrNull(value: unknown): number | null {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return null;
+  return Math.floor(numeric);
+}
+
+function parseQueueStatusFilter(value: unknown, fallback: QueueStatusFilter = "all"): QueueStatusFilter {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (QUEUE_STATUS_SET.has(normalized)) {
+    return normalized as QueueStatusFilter;
+  }
+  return fallback;
+}
+
+function parseQueueIdArray(value: unknown): number[] {
+  if (!Array.isArray(value)) return [];
+  const out = value
+    .map((item: unknown): number => Number(item))
+    .filter((item: number): boolean => Number.isFinite(item) && item > 0)
+    .map((item: number): number => Math.floor(item));
+  return Array.from(new Set(out));
 }
 
 function isPlaceholderQueueName(value: unknown): boolean {
@@ -530,35 +562,76 @@ async function fetchPreviewProductForQueue(req: NextRequest, pid: string): Promi
   }
 }
 
-async function enrichStaleQueueRows(
+type QueueEnrichmentStats = {
+  scannedRows: number;
+  staleRows: number;
+  previewHits: number;
+  previewMisses: number;
+  mergedRows: number;
+  persistedRows: number;
+  persistFailures: number;
+};
+
+type QueueEnrichmentOptions = {
+  concurrency?: number;
+  persist?: boolean;
+  allRows?: boolean;
+};
+
+async function enrichQueueRowsWithStats(
   req: NextRequest,
   supabase: any,
   rawProducts: any[],
-  normalizedProducts: any[]
-): Promise<any[]> {
+  normalizedProducts: any[],
+  options: QueueEnrichmentOptions = {}
+): Promise<{ products: any[]; stats: QueueEnrichmentStats }> {
+  const stats: QueueEnrichmentStats = {
+    scannedRows: rawProducts.length,
+    staleRows: 0,
+    previewHits: 0,
+    previewMisses: 0,
+    mergedRows: 0,
+    persistedRows: 0,
+    persistFailures: 0,
+  };
+
   const staleIndexes = normalizedProducts.reduce<number[]>((out, product, index) => {
     if (isQueueProductStaleForDisplay(product)) out.push(index);
     return out;
   }, []);
+  stats.staleRows = staleIndexes.length;
+  const targetIndexes = options.allRows
+    ? normalizedProducts.map((_: any, index: number) => index)
+    : staleIndexes;
 
-  if (staleIndexes.length === 0) return rawProducts;
+  if (targetIndexes.length === 0) {
+    return { products: rawProducts, stats };
+  }
 
   const output = [...rawProducts];
-  const concurrency = 3;
-  for (let i = 0; i < staleIndexes.length; i += concurrency) {
-    const batchIndexes = staleIndexes.slice(i, i + concurrency);
+  const concurrency = clampInteger(options.concurrency ?? 3, 1, 6, 3);
+  const shouldPersist = options.persist !== false;
+
+  for (let i = 0; i < targetIndexes.length; i += concurrency) {
+    const batchIndexes = targetIndexes.slice(i, i + concurrency);
     const batchResults = await Promise.all(
       batchIndexes.map(async (index) => {
         const currentRaw = rawProducts[index];
         const pid = String(currentRaw?.cj_product_id || "").trim();
-        if (!pid) return null;
+        if (!pid) return { previewHit: false, merged: false, persisted: false, persistFailed: false } as const;
 
         const previewProduct = await fetchPreviewProductForQueue(req, pid);
-        if (!previewProduct) return null;
+        if (!previewProduct) {
+          return { previewHit: false, merged: false, persisted: false, persistFailed: false } as const;
+        }
 
         const mergedProduct = mergeQueueProductWithPreview(currentRaw, previewProduct);
         const patch = buildEnrichmentPatch(currentRaw, mergedProduct);
-        if (Object.keys(patch).length > 0) {
+        const hasPatch = Object.keys(patch).length > 0;
+        let persisted = false;
+        let persistFailed = false;
+
+        if (hasPatch && shouldPersist) {
           const updatePayload = { ...patch, updated_at: new Date().toISOString() };
           try {
             let updateQuery = supabase.from("product_queue").update(updatePayload);
@@ -570,13 +643,17 @@ async function enrichStaleQueueRows(
             }
             const { error } = await updateQuery;
             if (error) {
+              persistFailed = true;
               console.warn("[Queue GET] Failed to persist enrichment patch:", {
                 id: currentRaw?.id,
                 pid,
                 error: error.message,
               });
+            } else {
+              persisted = true;
             }
           } catch (persistError: any) {
+            persistFailed = true;
             console.warn("[Queue GET] Enrichment persist exception:", {
               id: currentRaw?.id,
               pid,
@@ -584,17 +661,109 @@ async function enrichStaleQueueRows(
             });
           }
         }
-        return { index, mergedProduct };
+        return {
+          previewHit: true,
+          merged: hasPatch,
+          persisted,
+          persistFailed,
+          index,
+          mergedProduct,
+        } as const;
       })
     );
 
     for (const result of batchResults) {
       if (!result) continue;
-      output[result.index] = result.mergedProduct;
+      if (result.previewHit) stats.previewHits += 1;
+      else stats.previewMisses += 1;
+      if (result.merged) stats.mergedRows += 1;
+      if (result.persisted) stats.persistedRows += 1;
+      if (result.persistFailed) stats.persistFailures += 1;
+      if ("index" in result && typeof result.index === "number") {
+        output[result.index] = result.mergedProduct;
+      }
     }
   }
 
-  return output;
+  return { products: output, stats };
+}
+
+async function enrichStaleQueueRows(
+  req: NextRequest,
+  supabase: any,
+  rawProducts: any[],
+  normalizedProducts: any[]
+): Promise<any[]> {
+  const { products } = await enrichQueueRowsWithStats(req, supabase, rawProducts, normalizedProducts, {
+    concurrency: 3,
+    persist: true,
+  });
+  return products;
+}
+
+type QueueBackfillChunkResult = {
+  status: QueueStatusFilter;
+  cursor: number | null;
+  nextCursor: number | null;
+  chunkSize: number;
+  done: boolean;
+  stats: QueueEnrichmentStats;
+};
+
+async function runQueueBackfillChunk(
+  req: NextRequest,
+  supabase: any,
+  input: {
+    status: QueueStatusFilter;
+    cursor: number | null;
+    chunkSize: number;
+    ids: number[];
+    concurrency: number;
+  }
+): Promise<QueueBackfillChunkResult> {
+  const targetIds = Array.from(new Set(input.ids));
+  let query = supabase.from("product_queue").select("*").order("id", { ascending: true });
+
+  if (targetIds.length > 0) {
+    query = query.in("id", targetIds);
+    if (input.status !== "all") {
+      query = query.eq("status", input.status);
+    }
+  } else {
+    if (input.status !== "all") {
+      query = query.eq("status", input.status);
+    }
+    if (input.cursor != null) {
+      query = query.gt("id", input.cursor);
+    }
+    query = query.limit(input.chunkSize);
+  }
+
+  const { data: rows, error } = await query;
+  if (error) {
+    throw new Error(error.message || "Failed to query queue backfill chunk");
+  }
+
+  const rawRows = rows || [];
+  const normalizedRows = rawRows.map((row: any) => normalizeQueueProductRow(row));
+  const { stats } = await enrichQueueRowsWithStats(req, supabase, rawRows, normalizedRows, {
+    concurrency: input.concurrency,
+    persist: true,
+    allRows: true,
+  });
+
+  const done = targetIds.length > 0 || rawRows.length < input.chunkSize;
+  const lastRow = rawRows.length > 0 ? rawRows[rawRows.length - 1] : null;
+  const nextCursor = !done && lastRow ? parsePositiveIntegerOrNull(lastRow?.id) : null;
+
+  return {
+    status: input.status,
+    cursor: input.cursor,
+    nextCursor,
+    chunkSize: input.chunkSize,
+    done,
+    stats,
+  };
 }
 
 export async function GET(req: NextRequest) {
@@ -609,12 +778,12 @@ export async function GET(req: NextRequest) {
     }
 
     const { searchParams } = new URL(req.url);
-    const status = searchParams.get("status") || "pending";
+    const status = parseQueueStatusFilter(searchParams.get("status"), "pending");
     const batchId = searchParams.get("batch_id");
     const category = searchParams.get("category");
     const cjProductId = (searchParams.get("cj_product_id") || "").trim();
-    const limit = Math.min(100, Number(searchParams.get("limit") || 50));
-    const offset = Number(searchParams.get("offset") || 0);
+    const limit = clampInteger(searchParams.get("limit"), 1, 100, 50);
+    const offset = clampInteger(searchParams.get("offset"), 0, 1_000_000, 0);
 
     let query = supabase.from('product_queue').select('*');
     
@@ -708,10 +877,52 @@ export async function PATCH(req: NextRequest) {
     }
 
     const body = await req.json();
-    const { ids, action, data } = body;
+    const { ids, action, data } = body || {};
 
-    if (!ids || !Array.isArray(ids) || ids.length === 0) {
-      return NextResponse.json({ ok: false, error: "No product IDs provided" }, { status: 400 });
+    if (action === "backfill") {
+      const parsedIds = parseQueueIdArray(ids);
+      const parsedStatus = parseQueueStatusFilter(body?.status, "all");
+      const parsedCursor = parsePositiveIntegerOrNull(body?.cursor);
+      const parsedChunkSize = clampInteger(body?.chunkSize, 1, 20, 6);
+      const parsedConcurrency = clampInteger(body?.concurrency, 1, 6, 3);
+
+      try {
+        const result = await runQueueBackfillChunk(req, supabase, {
+          status: parsedStatus,
+          cursor: parsedCursor,
+          chunkSize: parsedChunkSize,
+          ids: parsedIds,
+          concurrency: parsedConcurrency,
+        });
+
+        return NextResponse.json({
+          ok: true,
+          action: "backfill",
+          status: result.status,
+          cursor: result.cursor,
+          nextCursor: result.nextCursor,
+          chunkSize: result.chunkSize,
+          done: result.done,
+          scanned: result.stats.scannedRows,
+          stale: result.stats.staleRows,
+          updated: result.stats.mergedRows,
+          persisted: result.stats.persistedRows,
+          previewHits: result.stats.previewHits,
+          previewMisses: result.stats.previewMisses,
+          persistFailures: result.stats.persistFailures,
+        });
+      } catch (backfillError: any) {
+        console.error("[Queue PATCH] Backfill error:", backfillError);
+        return NextResponse.json(
+          { ok: false, error: backfillError?.message || "Backfill failed" },
+          { status: 500 }
+        );
+      }
+    }
+
+    const parsedIds = parseQueueIdArray(ids);
+    if (parsedIds.length === 0) {
+      return NextResponse.json({ ok: false, error: "No valid product IDs provided" }, { status: 400 });
     }
 
     let updateData: Record<string, any> = { updated_at: new Date().toISOString() };
@@ -748,7 +959,7 @@ export async function PATCH(req: NextRequest) {
     const { error: updateError } = await supabase
       .from('product_queue')
       .update(updateData)
-      .in('id', ids);
+      .in('id', parsedIds);
 
     if (updateError) {
       console.error("[Queue PATCH] Update error:", updateError);
@@ -759,13 +970,13 @@ export async function PATCH(req: NextRequest) {
       await supabase.from('import_logs').insert({
         action: `queue_${action}`,
         status: 'success',
-        details: { ids, action, data }
+        details: { ids: parsedIds, action, data }
       });
     } catch (logErr) {
       console.error("[Queue PATCH] Log error:", logErr);
     }
 
-    return NextResponse.json({ ok: true, updated: ids.length });
+    return NextResponse.json({ ok: true, updated: parsedIds.length });
   } catch (e: any) {
     console.error("[Queue PATCH] Error:", e);
     return NextResponse.json({ ok: false, error: e?.message || "Server error" }, { status: 500 });
