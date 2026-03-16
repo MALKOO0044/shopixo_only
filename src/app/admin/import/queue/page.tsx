@@ -120,17 +120,45 @@ function parseQueueVariantPricing(value: QueueProduct["variant_pricing"]): any[]
   return Array.isArray(parsed) ? parsed : [];
 }
 
+const PLACEHOLDER_QUEUE_CATEGORY_TOKENS = new Set([
+  "general",
+  "uncategorized",
+  "unknown",
+  "misc",
+  "others",
+]);
+
+function isPlaceholderQueueName(value: unknown): boolean {
+  if (typeof value !== "string") return true;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return true;
+  if (/^cj product\b/.test(normalized)) return true;
+  if (/^unavailable cj product\b/.test(normalized)) return true;
+  if (/^unknown product\b/.test(normalized)) return true;
+  return false;
+}
+
+function isPlaceholderQueueCategory(value: unknown): boolean {
+  if (typeof value !== "string") return true;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return true;
+  return PLACEHOLDER_QUEUE_CATEGORY_TOKENS.has(normalized);
+}
+
 function resolveQueueDisplayName(product: QueueProduct): string {
   const direct = [product.display_name, product.name_en, product.name]
-    .find((value) => typeof value === "string" && value.trim().length > 0);
+    .find((value) => typeof value === "string" && value.trim().length > 0 && !isPlaceholderQueueName(value));
   if (direct) return direct.trim();
+  const fallback = [product.display_name, product.name_en, product.name]
+    .find((value) => typeof value === "string" && value.trim().length > 0);
+  if (fallback) return fallback.trim();
   const suffix = String(product.cj_product_id || "").slice(-10);
   return suffix ? `CJ Product ${suffix}` : "CJ Product";
 }
 
 function resolveQueueDisplayCategory(product: QueueProduct): string {
   const direct = [product.display_category, product.category_name, product.category]
-    .find((value) => typeof value === "string" && value.trim().length > 0);
+    .find((value) => typeof value === "string" && value.trim().length > 0 && !isPlaceholderQueueCategory(value));
   return direct ? direct.trim() : "General";
 }
 

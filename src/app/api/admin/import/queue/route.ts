@@ -150,6 +150,453 @@ function deriveQueueStockTotal(product: any, variants: any[]): number {
   return Math.floor(fromVariants.reduce((sum, value) => sum + value, 0));
 }
 
+const PLACEHOLDER_QUEUE_CATEGORY_TOKENS = new Set([
+  "general",
+  "uncategorized",
+  "unknown",
+  "misc",
+  "others",
+]);
+
+function toFiniteNumber(value: unknown, fallback = 0): number {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : fallback;
+}
+
+function toPositiveNumberOrNull(value: unknown): number | null {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return null;
+  return num;
+}
+
+function isPlaceholderQueueName(value: unknown): boolean {
+  if (!isNonEmptyString(value)) return true;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return true;
+  if (/^cj product\b/.test(normalized)) return true;
+  if (/^unavailable cj product\b/.test(normalized)) return true;
+  if (/^unknown product\b/.test(normalized)) return true;
+  return false;
+}
+
+function isPlaceholderQueueCategory(value: unknown): boolean {
+  if (!isNonEmptyString(value)) return true;
+  const normalized = value.trim().toLowerCase();
+  return PLACEHOLDER_QUEUE_CATEGORY_TOKENS.has(normalized);
+}
+
+function pickDisplayName(product: any): string {
+  const candidates = [product?.display_name, product?.name_en, product?.name, product?.title, product?.product_name];
+  const preferred = candidates.find((value) => isNonEmptyString(value) && !isPlaceholderQueueName(value));
+  if (preferred) return preferred.trim();
+  const fallback = candidates.find((value) => isNonEmptyString(value));
+  if (fallback) return String(fallback).trim();
+  return `CJ Product ${String(product?.cj_product_id || "").slice(-10)}`;
+}
+
+function pickDisplayCategory(product: any): string {
+  const candidates = [product?.display_category, product?.category_name, product?.category];
+  const preferred = candidates.find((value) => isNonEmptyString(value) && !isPlaceholderQueueCategory(value));
+  if (preferred) return preferred.trim();
+  const fallback = candidates.find((value) => isNonEmptyString(value));
+  if (fallback) return String(fallback).trim();
+  return "General";
+}
+
+function hasMeaningfulVariantData(variants: any[]): boolean {
+  return variants.some((variant: any) => {
+    if (!variant || typeof variant !== "object") return false;
+    if (isNonEmptyString(variant?.color) || isNonEmptyString(variant?.size)) return true;
+    const stock = toFiniteNumber(
+      variant?.stock ?? variant?.totalStock ?? (toFiniteNumber(variant?.cjStock, 0) + toFiniteNumber(variant?.factoryStock, 0)),
+      0
+    );
+    if (stock > 0) return true;
+    const cost = toFiniteNumber(variant?.variantPriceUSD ?? variant?.variantPrice ?? variant?.costPrice ?? variant?.price, 0);
+    return cost > 0;
+  });
+}
+
+function normalizeQueueProductRow(product: any) {
+  const parsedVariants = parseQueueArray(product?.variants);
+  const parsedVariantPricing = parseQueueArray(product?.variant_pricing);
+  const parsedColorImageMap = normalizeQueueColorImageMap(product?.color_image_map);
+
+  let normalizedImages = normalizeQueueImages(product?.images);
+  if (normalizedImages.length === 0) normalizedImages = normalizeQueueImages(product?.image);
+  if (normalizedImages.length === 0 && parsedColorImageMap) {
+    normalizedImages = normalizeQueueImages(Object.values(parsedColorImageMap));
+  }
+  if (normalizedImages.length === 0) {
+    normalizedImages = normalizeQueueImages(
+      parsedVariants.map((variant: any) => variant?.variantImage || variant?.colorImage || variant?.image)
+    );
+  }
+
+  let availableColors = parseQueueStringArray(product?.available_colors);
+  if (availableColors.length === 0) {
+    availableColors = parsedVariants
+      .map((variant: any) => (isNonEmptyString(variant?.color) ? variant.color.trim() : ""))
+      .filter((value) => value.length > 0);
+  }
+
+  let availableSizes = parseQueueStringArray(product?.available_sizes);
+  if (availableSizes.length === 0) {
+    availableSizes = parsedVariants
+      .map((variant: any) => (isNonEmptyString(variant?.size) ? variant.size.trim() : ""))
+      .filter((value) => value.length > 0);
+  }
+
+  const displayName = pickDisplayName(product);
+  const displayCategory = pickDisplayCategory(product);
+
+  return {
+    ...product,
+    name_en: isNonEmptyString(product?.name_en) ? product.name_en : displayName,
+    category: isNonEmptyString(product?.category) ? product.category : displayCategory,
+    images: normalizedImages,
+    variants: parsedVariants,
+    variant_pricing: parsedVariantPricing,
+    available_colors: availableColors,
+    available_sizes: availableSizes,
+    color_image_map: parsedColorImageMap || product?.color_image_map || null,
+    display_name: displayName,
+    display_category: displayCategory,
+    cj_price_usd: deriveQueueBaseCostUsd(product, parsedVariantPricing, parsedVariants),
+    stock_total: deriveQueueStockTotal(product, parsedVariants),
+  };
+}
+
+function isQueueProductStaleForDisplay(product: any): boolean {
+  const displayName = pickDisplayName(product);
+  const displayCategory = pickDisplayCategory(product);
+  const images = normalizeQueueImages(product?.images);
+  const variants = parseQueueArray(product?.variants);
+  const variantPricing = parseQueueArray(product?.variant_pricing);
+  const colors = parseQueueStringArray(product?.available_colors);
+  const sizes = parseQueueStringArray(product?.available_sizes);
+  const baseCost = deriveQueueBaseCostUsd(product, variantPricing, variants);
+  const stockTotal = deriveQueueStockTotal(product, variants);
+  const rating = toPositiveNumberOrNull(product?.displayed_rating) ?? toPositiveNumberOrNull(product?.supplier_rating);
+  const reviewCount = Math.floor(Math.max(0, toFiniteNumber(product?.review_count, 0)));
+
+  let staleSignals = 0;
+  if (isPlaceholderQueueName(displayName)) staleSignals += 2;
+  if (images.length === 0) staleSignals += 2;
+  if (isPlaceholderQueueCategory(displayCategory)) staleSignals += 1;
+  if (baseCost <= 0) staleSignals += 1;
+  if (stockTotal <= 0 && !hasMeaningfulVariantData(variants)) staleSignals += 1;
+  if (colors.length === 0 && sizes.length === 0 && variants.length <= 1) staleSignals += 1;
+  if (rating == null && reviewCount <= 0) staleSignals += 1;
+  return staleSignals >= 2;
+}
+
+function buildQueueVariantPricingFromPreviewVariants(variants: any[]): any[] {
+  if (!Array.isArray(variants) || variants.length === 0) return [];
+  return variants.map((variant: any, index: number) => {
+    const color = isNonEmptyString(variant?.color) ? variant.color.trim() : "";
+    const size = isNonEmptyString(variant?.size) ? variant.size.trim() : "";
+    const variantId =
+      (isNonEmptyString(variant?.variantId) && variant.variantId.trim()) ||
+      (isNonEmptyString(variant?.vid) && variant.vid.trim()) ||
+      `${index + 1}`;
+    const variantSku =
+      (isNonEmptyString(variant?.variantSku) && variant.variantSku.trim()) ||
+      (isNonEmptyString(variant?.sku) && variant.sku.trim()) ||
+      variantId;
+    const variantImage =
+      normalizeHttpUrl(variant?.variantImage) ||
+      normalizeHttpUrl(variant?.colorImage) ||
+      normalizeHttpUrl(variant?.image) ||
+      null;
+    const sellPriceSAR = toPositiveNumberOrNull(variant?.sellPriceSAR ?? variant?.price ?? variant?.sellPriceSar);
+    const sellPriceUSD = toPositiveNumberOrNull(variant?.sellPriceUSD ?? variant?.sellPriceUsd ?? variant?.priceUsd);
+    const costPrice = toPositiveNumberOrNull(variant?.variantPriceUSD ?? variant?.variantPrice ?? variant?.costPrice);
+    const shippingCost = toPositiveNumberOrNull(variant?.shippingPriceUSD ?? variant?.shippingCost ?? variant?.shippingPrice);
+    const stock = Math.max(
+      0,
+      Math.floor(
+        toFiniteNumber(
+          variant?.stock ??
+            variant?.totalStock ??
+            (toFiniteNumber(variant?.cjStock, 0) + toFiniteNumber(variant?.factoryStock, 0)),
+          0
+        )
+      )
+    );
+
+    return {
+      variantId,
+      sku: variantSku,
+      color: color || undefined,
+      size: size || undefined,
+      colorImage: variantImage || undefined,
+      price: sellPriceSAR ?? undefined,
+      priceUsd: sellPriceUSD ?? undefined,
+      marginPercent: toPositiveNumberOrNull(variant?.marginPercent ?? variant?.profitMargin ?? variant?.margin) ?? undefined,
+      costPrice: costPrice ?? undefined,
+      shippingCost: shippingCost ?? undefined,
+      stock,
+      cjStock: Math.max(0, Math.floor(toFiniteNumber(variant?.cjStock, stock))),
+      factoryStock: Math.max(0, Math.floor(toFiniteNumber(variant?.factoryStock, 0))),
+    };
+  });
+}
+
+function derivePreviewBaseCostUsd(previewProduct: any, previewVariantPricing: any[], previewVariants: any[]): number {
+  const directCandidates = previewVariants
+    .map((variant: any) => toPositiveNumberOrNull(variant?.variantPriceUSD ?? variant?.variantPrice ?? variant?.costPrice ?? variant?.priceUSD))
+    .filter((value: number | null): value is number => typeof value === "number");
+  if (directCandidates.length > 0) return Math.min(...directCandidates);
+
+  const pricingCandidates = previewVariantPricing
+    .map((variant: any) => toPositiveNumberOrNull(variant?.costPrice ?? variant?.variantPriceUSD ?? variant?.variantPrice ?? variant?.cost))
+    .filter((value: number | null): value is number => typeof value === "number");
+  if (pricingCandidates.length > 0) return Math.min(...pricingCandidates);
+
+  const minPriceUSD = toPositiveNumberOrNull(previewProduct?.minPriceUSD);
+  return minPriceUSD ?? 0;
+}
+
+function mergeQueueProductWithPreview(baseProduct: any, previewProduct: any): any {
+  if (!previewProduct || typeof previewProduct !== "object") return baseProduct;
+
+  const merged = { ...baseProduct };
+  const previewName = isNonEmptyString(previewProduct?.name) ? previewProduct.name.trim() : "";
+  if (previewName && (isPlaceholderQueueName(merged?.name_en) || !isNonEmptyString(merged?.name_en))) {
+    merged.name_en = previewName;
+  }
+
+  const previewCategory = isNonEmptyString(previewProduct?.categoryName) ? previewProduct.categoryName.trim() : "";
+  if (previewCategory) {
+    if (!isNonEmptyString(merged?.category_name) || isPlaceholderQueueCategory(merged?.category_name)) {
+      merged.category_name = previewCategory;
+    }
+    if (!isNonEmptyString(merged?.category) || isPlaceholderQueueCategory(merged?.category)) {
+      merged.category = previewCategory;
+    }
+  }
+
+  const previewImages = normalizeQueueImages(previewProduct?.images);
+  if (previewImages.length > 0 && normalizeQueueImages(merged?.images).length === 0) {
+    merged.images = previewImages;
+  }
+
+  const previewVariants = Array.isArray(previewProduct?.variants) ? previewProduct.variants : [];
+  if (previewVariants.length > 0) {
+    const currentVariants = parseQueueArray(merged?.variants);
+    if (currentVariants.length === 0 || !hasMeaningfulVariantData(currentVariants)) {
+      merged.variants = previewVariants;
+    }
+  }
+
+  const previewVariantPricing = buildQueueVariantPricingFromPreviewVariants(previewVariants);
+  if (previewVariantPricing.length > 0 && parseQueueArray(merged?.variant_pricing).length === 0) {
+    merged.variant_pricing = previewVariantPricing;
+  }
+
+  let previewColors = parseQueueStringArray(previewProduct?.availableColors);
+  if (previewColors.length === 0) {
+    previewColors = previewVariants
+      .map((variant: any) => (isNonEmptyString(variant?.color) ? variant.color.trim() : ""))
+      .filter((value) => value.length > 0);
+  }
+  if (previewColors.length > 0 && parseQueueStringArray(merged?.available_colors).length === 0) {
+    merged.available_colors = Array.from(new Set(previewColors));
+  }
+
+  let previewSizes = parseQueueStringArray(previewProduct?.availableSizes);
+  if (previewSizes.length === 0) {
+    previewSizes = previewVariants
+      .map((variant: any) => (isNonEmptyString(variant?.size) ? variant.size.trim() : ""))
+      .filter((value) => value.length > 0);
+  }
+  if (previewSizes.length > 0 && parseQueueStringArray(merged?.available_sizes).length === 0) {
+    merged.available_sizes = Array.from(new Set(previewSizes));
+  }
+
+  const previewBaseCostUsd = derivePreviewBaseCostUsd(previewProduct, previewVariantPricing, previewVariants);
+  if (!(toPositiveNumberOrNull(merged?.cj_price_usd) != null) && previewBaseCostUsd > 0) {
+    merged.cj_price_usd = previewBaseCostUsd;
+  }
+
+  const previewStock = Math.floor(Math.max(0, toFiniteNumber(previewProduct?.stock, 0)));
+  if (toFiniteNumber(merged?.stock_total, 0) <= 0 && previewStock > 0) {
+    merged.stock_total = previewStock;
+  }
+
+  const previewDisplayedRating = toPositiveNumberOrNull(previewProduct?.displayedRating);
+  if (!(toPositiveNumberOrNull(merged?.displayed_rating) != null) && previewDisplayedRating != null) {
+    merged.displayed_rating = previewDisplayedRating;
+  }
+
+  const previewSupplierRating = toPositiveNumberOrNull(previewProduct?.rating);
+  if (!(toPositiveNumberOrNull(merged?.supplier_rating) != null) && previewSupplierRating != null) {
+    merged.supplier_rating = previewSupplierRating;
+  }
+
+  const previewReviewCountRaw = Number(previewProduct?.reviewCount);
+  const previewReviewCount = Number.isFinite(previewReviewCountRaw) ? Math.max(0, Math.floor(previewReviewCountRaw)) : 0;
+  const currentReviewCount = Number(merged?.review_count);
+  if ((!Number.isFinite(currentReviewCount) || currentReviewCount <= 0) && previewReviewCount > 0) {
+    merged.review_count = previewReviewCount;
+  }
+
+  const previewRatingConfidence = toPositiveNumberOrNull(previewProduct?.ratingConfidence);
+  if (!(toPositiveNumberOrNull(merged?.rating_confidence) != null) && previewRatingConfidence != null) {
+    merged.rating_confidence = Math.max(0.05, Math.min(1, previewRatingConfidence));
+  }
+
+  if (!isNonEmptyString(merged?.store_sku) && isNonEmptyString(previewProduct?.storeSku)) {
+    merged.store_sku = previewProduct.storeSku.trim();
+  }
+  if (!isNonEmptyString(merged?.cj_sku) && isNonEmptyString(previewProduct?.cjSku)) {
+    merged.cj_sku = previewProduct.cjSku.trim();
+  }
+
+  return merged;
+}
+
+function valuesEqual(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (typeof left === "number" && typeof right === "number") {
+    return Number.isFinite(left) && Number.isFinite(right) && Math.abs(left - right) < 0.0001;
+  }
+  try {
+    return JSON.stringify(left) === JSON.stringify(right);
+  } catch {
+    return String(left) === String(right);
+  }
+}
+
+function buildEnrichmentPatch(originalProduct: any, mergedProduct: any): Record<string, any> {
+  const patchableFields = [
+    "name_en",
+    "category",
+    "category_name",
+    "images",
+    "variants",
+    "variant_pricing",
+    "available_colors",
+    "available_sizes",
+    "cj_price_usd",
+    "stock_total",
+    "displayed_rating",
+    "supplier_rating",
+    "rating_confidence",
+    "review_count",
+    "store_sku",
+    "cj_sku",
+  ];
+  const patch: Record<string, any> = {};
+  for (const field of patchableFields) {
+    if (!valuesEqual(originalProduct?.[field], mergedProduct?.[field])) {
+      patch[field] = mergedProduct?.[field] ?? null;
+    }
+  }
+  return patch;
+}
+
+async function fetchPreviewProductForQueue(req: NextRequest, pid: string): Promise<any | null> {
+  const normalizedPid = String(pid || "").trim();
+  if (!normalizedPid) return null;
+
+  const origin = req.nextUrl.origin;
+  if (!origin) return null;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 3500);
+  try {
+    const res = await fetch(
+      `${origin}/api/admin/cj/products/${encodeURIComponent(normalizedPid)}/details`,
+      {
+        method: "GET",
+        cache: "no-store",
+        signal: controller.signal,
+        headers: {
+          cookie: req.headers.get("cookie") || "",
+          "x-queue-enrich": "1",
+        },
+      }
+    );
+    if (!res.ok) return null;
+    const payload = await res.json();
+    if (!payload?.ok || !payload?.product) return null;
+    return payload.product;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function enrichStaleQueueRows(
+  req: NextRequest,
+  supabase: any,
+  rawProducts: any[],
+  normalizedProducts: any[]
+): Promise<any[]> {
+  const staleIndexes = normalizedProducts.reduce<number[]>((out, product, index) => {
+    if (isQueueProductStaleForDisplay(product)) out.push(index);
+    return out;
+  }, []);
+
+  if (staleIndexes.length === 0) return rawProducts;
+
+  const output = [...rawProducts];
+  const concurrency = 3;
+  for (let i = 0; i < staleIndexes.length; i += concurrency) {
+    const batchIndexes = staleIndexes.slice(i, i + concurrency);
+    const batchResults = await Promise.all(
+      batchIndexes.map(async (index) => {
+        const currentRaw = rawProducts[index];
+        const pid = String(currentRaw?.cj_product_id || "").trim();
+        if (!pid) return null;
+
+        const previewProduct = await fetchPreviewProductForQueue(req, pid);
+        if (!previewProduct) return null;
+
+        const mergedProduct = mergeQueueProductWithPreview(currentRaw, previewProduct);
+        const patch = buildEnrichmentPatch(currentRaw, mergedProduct);
+        if (Object.keys(patch).length > 0) {
+          const updatePayload = { ...patch, updated_at: new Date().toISOString() };
+          try {
+            let updateQuery = supabase.from("product_queue").update(updatePayload);
+            const numericId = Number(currentRaw?.id);
+            if (Number.isFinite(numericId) && numericId > 0) {
+              updateQuery = updateQuery.eq("id", numericId);
+            } else {
+              updateQuery = updateQuery.eq("cj_product_id", pid);
+            }
+            const { error } = await updateQuery;
+            if (error) {
+              console.warn("[Queue GET] Failed to persist enrichment patch:", {
+                id: currentRaw?.id,
+                pid,
+                error: error.message,
+              });
+            }
+          } catch (persistError: any) {
+            console.warn("[Queue GET] Enrichment persist exception:", {
+              id: currentRaw?.id,
+              pid,
+              error: persistError?.message || String(persistError),
+            });
+          }
+        }
+        return { index, mergedProduct };
+      })
+    );
+
+    for (const result of batchResults) {
+      if (!result) continue;
+      output[result.index] = result.mergedProduct;
+    }
+  }
+
+  return output;
+}
+
 export async function GET(req: NextRequest) {
   try {
     if (!isDbConfigured()) {
@@ -232,60 +679,10 @@ export async function GET(req: NextRequest) {
       imported: importedRes.count || 0,
     };
 
-    const normalizedProducts = (products || []).map((product: any) => {
-      const parsedVariants = parseQueueArray(product?.variants);
-      const parsedVariantPricing = parseQueueArray(product?.variant_pricing);
-      const parsedColorImageMap = normalizeQueueColorImageMap(product?.color_image_map);
-
-      let normalizedImages = normalizeQueueImages(product?.images);
-      if (normalizedImages.length === 0) normalizedImages = normalizeQueueImages(product?.image);
-      if (normalizedImages.length === 0 && parsedColorImageMap) {
-        normalizedImages = normalizeQueueImages(Object.values(parsedColorImageMap));
-      }
-      if (normalizedImages.length === 0) {
-        normalizedImages = normalizeQueueImages(
-          parsedVariants.map((variant: any) => variant?.variantImage || variant?.colorImage || variant?.image)
-        );
-      }
-
-      let availableColors = parseQueueStringArray(product?.available_colors);
-      if (availableColors.length === 0) {
-        availableColors = parsedVariants
-          .map((variant: any) => (isNonEmptyString(variant?.color) ? variant.color.trim() : ""))
-          .filter((value) => value.length > 0);
-      }
-
-      let availableSizes = parseQueueStringArray(product?.available_sizes);
-      if (availableSizes.length === 0) {
-        availableSizes = parsedVariants
-          .map((variant: any) => (isNonEmptyString(variant?.size) ? variant.size.trim() : ""))
-          .filter((value) => value.length > 0);
-      }
-
-      const displayName =
-        [product?.name_en, product?.name, product?.title, product?.product_name]
-          .find((value) => isNonEmptyString(value)) || `CJ Product ${String(product?.cj_product_id || "").slice(-10)}`;
-
-      const displayCategory =
-        [product?.category_name, product?.category]
-          .find((value) => isNonEmptyString(value)) || "General";
-
-      return {
-        ...product,
-        name_en: isNonEmptyString(product?.name_en) ? product.name_en : displayName,
-        category: isNonEmptyString(product?.category) ? product.category : displayCategory,
-        images: normalizedImages,
-        variants: parsedVariants,
-        variant_pricing: parsedVariantPricing,
-        available_colors: availableColors,
-        available_sizes: availableSizes,
-        color_image_map: parsedColorImageMap || product?.color_image_map || null,
-        display_name: displayName,
-        display_category: displayCategory,
-        cj_price_usd: deriveQueueBaseCostUsd(product, parsedVariantPricing, parsedVariants),
-        stock_total: deriveQueueStockTotal(product, parsedVariants),
-      };
-    });
+    const rawProducts = products || [];
+    const initiallyNormalizedProducts = rawProducts.map((product: any) => normalizeQueueProductRow(product));
+    const enrichedRawProducts = await enrichStaleQueueRows(req, supabase, rawProducts, initiallyNormalizedProducts);
+    const normalizedProducts = enrichedRawProducts.map((product: any) => normalizeQueueProductRow(product));
 
     return NextResponse.json({
       ok: true,
