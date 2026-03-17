@@ -1464,19 +1464,9 @@ export async function GET(
     const token = await getAccessToken();
 
     if (!token) {
-      const admin = getSupabaseAdmin();
-      const queueSnapshot = admin ? await loadQueueSnapshotPricedProduct(admin, pid, profitMargin) : null;
-      if (queueSnapshot) {
-        const duration = Date.now() - startTime;
-        return NextResponse.json(
-          { ok: true, product: queueSnapshot, duration, source: 'queue_snapshot' },
-          { headers: { 'Cache-Control': 'no-store' } }
-        );
-      }
-
       return NextResponse.json(
 
-        { ok: false, error: 'Failed to authenticate with CJ API' },
+        { ok: false, error: 'Failed to authenticate with CJ API', source: 'cj_unavailable' },
 
         { status: 500, headers: { 'Cache-Control': 'no-store' } }
 
@@ -1491,19 +1481,9 @@ export async function GET(
     const fullDetails = await fetchProductDetailsByPid(pid);
 
     if (!fullDetails) {
-      const admin = getSupabaseAdmin();
-      const queueSnapshot = admin ? await loadQueueSnapshotPricedProduct(admin, pid, profitMargin) : null;
-      if (queueSnapshot) {
-        const duration = Date.now() - startTime;
-        return NextResponse.json(
-          { ok: true, product: queueSnapshot, duration, source: 'queue_snapshot' },
-          { headers: { 'Cache-Control': 'no-store' } }
-        );
-      }
-
       return NextResponse.json(
 
-        { ok: false, error: 'Product not found in CJ API' },
+        { ok: false, error: 'Product not found in CJ API', source: 'cj_unavailable' },
 
         { status: 404, headers: { 'Cache-Control': 'no-store' } }
 

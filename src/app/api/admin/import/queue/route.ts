@@ -846,6 +846,7 @@ async function enrichQueueRowsWithStats(
     return out;
   }, []);
   stats.staleRows = staleIndexes.length;
+  const staleIndexSet = new Set<number>(staleIndexes);
   const targetIndexes = options.allRows
     ? normalizedProducts.map((_: any, index: number) => index)
     : staleIndexes;
@@ -863,10 +864,11 @@ async function enrichQueueRowsWithStats(
     const batchResults = await Promise.all(
       batchIndexes.map(async (index) => {
         const currentRaw = rawProducts[index];
+        const shouldEnforceBlockedUnavailable = staleIndexSet.has(index);
         const pid = String(currentRaw?.cj_product_id || "").trim();
         if (!pid) {
           let markerPersistFailed = false;
-          if (shouldPersist) {
+          if (shouldPersist && shouldEnforceBlockedUnavailable) {
             const marker = await persistQueueLiveSyncBlockedMarker(supabase, currentRaw, "", "missing_pid");
             markerPersistFailed = marker.failed;
           }
@@ -875,14 +877,14 @@ async function enrichQueueRowsWithStats(
             merged: false,
             persisted: false,
             persistFailed: markerPersistFailed,
-            blockedUnavailable: true,
+            blockedUnavailable: shouldEnforceBlockedUnavailable,
           } as const;
         }
 
         const previewResult = await fetchPreviewProductForQueue(req, pid);
         if (!previewResult) {
           let markerPersistFailed = false;
-          if (shouldPersist) {
+          if (shouldPersist && shouldEnforceBlockedUnavailable) {
             const marker = await persistQueueLiveSyncBlockedMarker(supabase, currentRaw, pid, "preview_unavailable");
             markerPersistFailed = marker.failed;
           }
@@ -891,13 +893,13 @@ async function enrichQueueRowsWithStats(
             merged: false,
             persisted: false,
             persistFailed: markerPersistFailed,
-            blockedUnavailable: true,
+            blockedUnavailable: shouldEnforceBlockedUnavailable,
           } as const;
         }
 
         if (!isLivePreviewSource(previewResult.source)) {
           let markerPersistFailed = false;
-          if (shouldPersist) {
+          if (shouldPersist && shouldEnforceBlockedUnavailable) {
             const reasonCode = previewResult.source === "queue_snapshot"
               ? "snapshot_source"
               : "non_live_source";
@@ -909,7 +911,7 @@ async function enrichQueueRowsWithStats(
             merged: false,
             persisted: false,
             persistFailed: markerPersistFailed,
-            blockedUnavailable: true,
+            blockedUnavailable: shouldEnforceBlockedUnavailable,
           } as const;
         }
 
