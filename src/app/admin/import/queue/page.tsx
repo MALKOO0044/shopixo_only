@@ -311,6 +311,9 @@ type QueueBackfillProgress = {
   done: boolean;
   scanned: number;
   stale: number;
+  liveHits: number;
+  snapshotHitsSkipped: number;
+  blockedUnavailable: number;
   updated: number;
   persisted: number;
   previewMisses: number;
@@ -371,6 +374,9 @@ export default function QueuePage() {
     done: false,
     scanned: 0,
     stale: 0,
+    liveHits: 0,
+    snapshotHitsSkipped: 0,
+    blockedUnavailable: 0,
     updated: 0,
     persisted: 0,
     previewMisses: 0,
@@ -444,6 +450,9 @@ export default function QueuePage() {
         const done = Boolean(data.done);
         const scanned = Number.isFinite(Number(data.scanned)) ? Number(data.scanned) : 0;
         const stale = Number.isFinite(Number(data.stale)) ? Number(data.stale) : 0;
+        const liveHits = Number.isFinite(Number(data.liveHits)) ? Number(data.liveHits) : 0;
+        const snapshotHitsSkipped = Number.isFinite(Number(data.snapshotHitsSkipped)) ? Number(data.snapshotHitsSkipped) : 0;
+        const blockedUnavailable = Number.isFinite(Number(data.blockedUnavailable)) ? Number(data.blockedUnavailable) : 0;
         const updated = Number.isFinite(Number(data.updated)) ? Number(data.updated) : 0;
         const persisted = Number.isFinite(Number(data.persisted)) ? Number(data.persisted) : 0;
         const previewMisses = Number.isFinite(Number(data.previewMisses)) ? Number(data.previewMisses) : 0;
@@ -464,6 +473,9 @@ export default function QueuePage() {
           cursor: nextCursor,
           scanned: prev.scanned + scanned,
           stale: prev.stale + stale,
+          liveHits: prev.liveHits + liveHits,
+          snapshotHitsSkipped: prev.snapshotHitsSkipped + snapshotHitsSkipped,
+          blockedUnavailable: prev.blockedUnavailable + blockedUnavailable,
           updated: prev.updated + updated,
           persisted: prev.persisted + persisted,
           previewMisses: prev.previewMisses + previewMisses,
@@ -948,6 +960,11 @@ export default function QueuePage() {
         <p className="mt-1">
           Scanned: {backfillProgress.scanned.toLocaleString()} · Stale: {backfillProgress.stale.toLocaleString()} · Updated: {backfillProgress.updated.toLocaleString()} · Persisted: {backfillProgress.persisted.toLocaleString()}
         </p>
+        {(backfillProgress.liveHits > 0 || backfillProgress.snapshotHitsSkipped > 0 || backfillProgress.blockedUnavailable > 0) && (
+          <p className="mt-1 text-blue-800">
+            Live hits: {backfillProgress.liveHits.toLocaleString()} · Snapshot skipped: {backfillProgress.snapshotHitsSkipped.toLocaleString()} · Blocked unavailable: {backfillProgress.blockedUnavailable.toLocaleString()}
+          </p>
+        )}
         {(backfillProgress.previewMisses > 0 || backfillProgress.persistFailures > 0) && (
           <p className="mt-1 text-blue-800">
             Preview misses: {backfillProgress.previewMisses.toLocaleString()} · Persist failures: {backfillProgress.persistFailures.toLocaleString()}

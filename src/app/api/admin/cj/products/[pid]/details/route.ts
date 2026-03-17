@@ -8,7 +8,6 @@ import type { PricedProduct, PricedVariant, InventoryVariant, ProductInventory }
 
 import { computeRating, normalizeDisplayedRating } from '@/lib/rating/engine';
 
-import { buildSyntheticReviewProfile } from '@/lib/reviews/synthetic-feedback';
 
 import { createClient } from '@supabase/supabase-js';
 
@@ -2867,13 +2866,10 @@ export async function GET(
 
 
     if (!(Number.isFinite(reviewCount) && reviewCount > 0)) {
-
-      const syntheticReviewProfile = buildSyntheticReviewProfile(pid);
-
-      reviewCount = syntheticReviewProfile.reviewCount;
-
-      reviewMetricsSource = 'synthetic';
-
+      reviewCount = 0;
+      if (reviewMetricsSource !== 'supplier') {
+        reviewMetricsSource = 'none';
+      }
     }
 
 
@@ -3125,6 +3121,8 @@ export async function GET(
       product: pricedProduct,
 
       duration,
+
+      source: 'cj_live',
 
     }, { headers: { 'Cache-Control': 'no-store' } });
 

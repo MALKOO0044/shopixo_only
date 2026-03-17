@@ -16,7 +16,6 @@ import { usdToSar, sarToUsd, computeRetailFromLanded } from '@/lib/pricing';
 
 import { computeRating, normalizeDisplayedRating } from '@/lib/rating/engine';
 
-import { buildSyntheticReviewProfile } from '@/lib/reviews/synthetic-feedback';
 
 import { dedupeLabelsCaseInsensitive, extractCanonicalSize, normalizeCjProductId, normalizeSizeList } from '@/lib/import/normalization';
 
@@ -5747,13 +5746,10 @@ async function handleSearch(req: Request, isPost: boolean) {
 
 
       if (!(Number.isFinite(reviewCount) && reviewCount > 0)) {
-
-        const syntheticReviewProfile = buildSyntheticReviewProfile(pid);
-
-        reviewCount = syntheticReviewProfile.reviewCount;
-
-        reviewMetricsSource = 'synthetic';
-
+        reviewCount = 0;
+        if (reviewMetricsSource !== 'supplier') {
+          reviewMetricsSource = 'none';
+        }
       }
 
 

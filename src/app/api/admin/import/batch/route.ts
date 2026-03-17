@@ -182,6 +182,10 @@ export async function POST(req: NextRequest) {
 
     let skippedVideoQualityGateCount = 0;
 
+    let blockedUnavailableCount = 0;
+
+    let skippedLowQualityDowngradeCount = 0;
+
     const failedProducts: string[] = [];
 
     const errorMessages: string[] = [];
@@ -433,8 +437,19 @@ export async function POST(req: NextRequest) {
 
 
       if (result.success) {
-
+        if (result.skippedLowQualityDowngrade) {
+          skippedLowQualityDowngradeCount++;
+          continue;
+        }
         addedCount++;
+        if (result.blockedUnavailable) {
+          blockedUnavailableCount++;
+          if (errorMessages.length < 3) {
+            errorMessages.push(
+              `Product ${productId} queued as blocked_unavailable due to insufficient real CJ data.`
+            );
+          }
+        }
 
       } else {
 
@@ -454,7 +469,8 @@ export async function POST(req: NextRequest) {
 
     
 
-    if (addedCount === 0 && products.length > 0) {
+    const hasSuccessfulOutcome = addedCount > 0 || skippedLowQualityDowngradeCount > 0;
+    if (!hasSuccessfulOutcome && products.length > 0) {
 
       const errorDetail = errorMessages.length > 0 
 
@@ -498,6 +514,14 @@ export async function POST(req: NextRequest) {
 
       products_count: products.length, 
 
+      products_added: addedCount,
+
+      products_failed: failedCount,
+
+      products_blocked_unavailable: blockedUnavailableCount,
+
+      products_skipped_low_quality_downgrade: skippedLowQualityDowngradeCount,
+
       media_mode: mediaMode || 'any',
 
       requires_video: requiresVideo,
@@ -524,11 +548,17 @@ export async function POST(req: NextRequest) {
 
       productsFailed: failedCount,
 
+      productsBlockedUnavailable: blockedUnavailableCount,
+
+      productsSkippedLowQualityDowngrade: skippedLowQualityDowngradeCount,
+
       productsSkippedMissingVideo: skippedMissingVideoCount,
 
       productsSkippedVideoQualityGate: skippedVideoQualityGateCount,
 
-      ...(failedCount > 0 && { warning: `${failedCount} products failed to add` }),
+      ...((failedCount > 0 || blockedUnavailableCount > 0 || skippedLowQualityDowngradeCount > 0) && {
+        warning: `${failedCount} products failed, ${blockedUnavailableCount} products queued as blocked_unavailable, ${skippedLowQualityDowngradeCount} low-quality updates skipped to protect rich queue rows.`,
+      }),
 
     });
 

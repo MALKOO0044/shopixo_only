@@ -729,6 +729,12 @@ function deriveImportQueueStockTotal(product: any, variants: any[]): number {
 }
 
 function isQueueRowLikelyStaleForImport(product: any): boolean {
+  const inventoryStatus = String(product?.inventory_status || '').trim().toLowerCase();
+  const inventoryErrorMessage = String(product?.inventory_error_message || '').trim();
+  if (inventoryStatus === 'blocked_unavailable') return true;
+  if (inventoryErrorMessage.includes(`${IMPORT_LIVE_SYNC_BLOCK_PREFIX}:`)) return true;
+  if (inventoryErrorMessage.includes('INGESTION_FIDELITY_BLOCKED:')) return true;
+
   const displayName = String(product?.name_en || product?.display_name || '').trim();
   const displayCategory = String(product?.category_name || product?.category || product?.display_category || '').trim();
   const images = normalizeImportQueueImages(product?.images);
@@ -814,6 +820,77 @@ function deriveImportPreviewBaseCostUsd(previewProduct: any, previewVariantPrici
   return minPriceUSD ?? 0;
 }
 
+const IMPORT_LIVE_SYNC_BLOCK_PREFIX = 'LIVE_SYNC_BLOCKED';
+
+function isLiveImportPreviewSource(source: unknown): boolean {
+  return String(source || '').trim().toLowerCase() === 'cj_live';
+}
+
+function buildImportLiveSyncBlockMessage(reasonCode: string): string {
+  return `${IMPORT_LIVE_SYNC_BLOCK_PREFIX}:${reasonCode}:${new Date().toISOString()}`;
+}
+
+async function persistImportLiveSyncBlockedMarker(
+  admin: any,
+  queueRow: any,
+  pid: string,
+  reasonCode: string
+): Promise<{ updated: boolean; failed: boolean }> {
+  const reasonToken = `${IMPORT_LIVE_SYNC_BLOCK_PREFIX}:${reasonCode}:`;
+  const currentStatus = String(queueRow?.inventory_status || '').trim().toLowerCase();
+  const currentMessage = typeof queueRow?.inventory_error_message === 'string' ? queueRow.inventory_error_message : '';
+
+  if (currentStatus === 'blocked_unavailable' && currentMessage.includes(reasonToken)) {
+    return { updated: false, failed: false };
+  }
+
+  const payload: Record<string, any> = {
+    updated_at: new Date().toISOString(),
+  };
+
+  if (currentStatus !== 'blocked_unavailable') {
+    payload.inventory_status = 'blocked_unavailable';
+  }
+  if (!currentMessage.includes(reasonToken)) {
+    payload.inventory_error_message = buildImportLiveSyncBlockMessage(reasonCode);
+  }
+
+  if (Object.keys(payload).length <= 1) {
+    return { updated: false, failed: false };
+  }
+
+  try {
+    let updateQuery = admin.from('product_queue').update(payload);
+    const numericId = Number(queueRow?.id);
+    if (Number.isFinite(numericId) && numericId > 0) {
+      updateQuery = updateQuery.eq('id', numericId);
+    } else if (pid) {
+      updateQuery = updateQuery.eq('cj_product_id', pid);
+    } else {
+      return { updated: false, failed: false };
+    }
+    const { error } = await updateQuery;
+    if (error) {
+      console.warn('[Import Execute] Failed to persist live-sync blocked marker:', {
+        id: queueRow?.id,
+        pid,
+        reasonCode,
+        error: error.message,
+      });
+      return { updated: false, failed: true };
+    }
+    return { updated: true, failed: false };
+  } catch (persistError: any) {
+    console.warn('[Import Execute] Exception persisting live-sync blocked marker:', {
+      id: queueRow?.id,
+      pid,
+      reasonCode,
+      error: persistError?.message || String(persistError),
+    });
+    return { updated: false, failed: true };
+  }
+}
+
 function mergeQueueImportRowWithPreview(baseProduct: any, previewProduct: any): any {
   if (!previewProduct || typeof previewProduct !== 'object') return baseProduct;
 
@@ -836,6 +913,38 @@ function mergeQueueImportRowWithPreview(baseProduct: any, previewProduct: any): 
   const previewImages = normalizeImportQueueImages(previewProduct?.images);
   if (previewImages.length > 0 && normalizeImportQueueImages(merged?.images).length === 0) {
     merged.images = previewImages;
+  }
+
+  const previewVideo4k = normalizeImportHttpUrl(previewProduct?.video4kUrl);
+  if (previewVideo4k && !normalizeImportHttpUrl(merged?.video_4k_url)) {
+    merged.video_4k_url = previewVideo4k;
+  }
+
+  const previewVideo = normalizeImportHttpUrl(previewProduct?.videoUrl) || previewVideo4k;
+  if (previewVideo && !normalizeImportHttpUrl(merged?.video_url)) {
+    merged.video_url = previewVideo;
+  }
+
+  const previewVideoSource = normalizeImportHttpUrl(previewProduct?.videoSourceUrl);
+  if (previewVideoSource && !normalizeImportHttpUrl(merged?.video_source_url)) {
+    merged.video_source_url = previewVideoSource;
+  }
+
+  const previewVideoMode = String(previewProduct?.videoDeliveryMode || '').trim();
+  if (!isNonEmptyImportString(merged?.video_delivery_mode) && /^(native|enhanced|passthrough)$/i.test(previewVideoMode)) {
+    merged.video_delivery_mode = previewVideoMode.toLowerCase();
+  }
+
+  if (typeof merged?.video_quality_gate_passed !== 'boolean' && typeof previewProduct?.videoQualityGatePassed === 'boolean') {
+    merged.video_quality_gate_passed = previewProduct.videoQualityGatePassed;
+  }
+
+  const previewQualityHint = String(previewProduct?.videoSourceQualityHint || '').trim().toLowerCase();
+  if (
+    !isNonEmptyImportString(merged?.video_source_quality_hint) &&
+    /^(4k|hd|sd|unknown)$/.test(previewQualityHint)
+  ) {
+    merged.video_source_quality_hint = previewQualityHint;
   }
 
   const previewVariants = Array.isArray(previewProduct?.variants) ? previewProduct.variants : [];
@@ -869,6 +978,16 @@ function mergeQueueImportRowWithPreview(baseProduct: any, previewProduct: any): 
   }
   if (previewSizes.length > 0 && parseImportQueueStringArray(merged?.available_sizes).length === 0) {
     merged.available_sizes = Array.from(new Set(previewSizes));
+  }
+
+  const previewModels = parseImportQueueStringArray(previewProduct?.availableModels);
+  if (previewModels.length > 0 && parseImportQueueStringArray(merged?.available_models).length === 0) {
+    merged.available_models = Array.from(new Set(previewModels));
+  }
+
+  const previewColorImageMap = parseColorImageMap(previewProduct?.colorImageMap);
+  if (Object.keys(previewColorImageMap).length > 0 && Object.keys(parseColorImageMap(merged?.color_image_map)).length === 0) {
+    merged.color_image_map = previewColorImageMap;
   }
 
   const previewBaseCostUsd = deriveImportPreviewBaseCostUsd(previewProduct, previewVariantPricing, previewVariants);
@@ -912,6 +1031,101 @@ function mergeQueueImportRowWithPreview(baseProduct: any, previewProduct: any): 
     merged.cj_sku = previewProduct.cjSku.trim();
   }
 
+  const previewDescription = isNonEmptyImportString(previewProduct?.description) ? previewProduct.description.trim() : '';
+  if (previewDescription && !isNonEmptyImportString(merged?.description_en)) {
+    merged.description_en = previewDescription;
+  }
+
+  const previewOverview = isNonEmptyImportString(previewProduct?.overview) ? previewProduct.overview.trim() : '';
+  if (previewOverview && !isNonEmptyImportString(merged?.overview)) {
+    merged.overview = previewOverview;
+  }
+
+  const previewProductInfo = isNonEmptyImportString(previewProduct?.productInfo) ? previewProduct.productInfo.trim() : '';
+  if (previewProductInfo && !isNonEmptyImportString(merged?.product_info)) {
+    merged.product_info = previewProductInfo;
+  }
+
+  const previewSizeInfo = isNonEmptyImportString(previewProduct?.sizeInfo) ? previewProduct.sizeInfo.trim() : '';
+  if (previewSizeInfo && !isNonEmptyImportString(merged?.size_info)) {
+    merged.size_info = previewSizeInfo;
+  }
+
+  const previewProductNote = isNonEmptyImportString(previewProduct?.productNote) ? previewProduct.productNote.trim() : '';
+  if (previewProductNote && !isNonEmptyImportString(merged?.product_note)) {
+    merged.product_note = previewProductNote;
+  }
+
+  const previewPackingList = isNonEmptyImportString(previewProduct?.packingList) ? previewProduct.packingList.trim() : '';
+  if (previewPackingList && !isNonEmptyImportString(merged?.packing_list)) {
+    merged.packing_list = previewPackingList;
+  }
+
+  const previewSizeChartImages = normalizeImportQueueImages(previewProduct?.sizeChartImages);
+  if (previewSizeChartImages.length > 0 && normalizeImportQueueImages(merged?.size_chart_images).length === 0) {
+    merged.size_chart_images = previewSizeChartImages;
+  }
+
+  const previewWeight = toPositiveNumberOrNull(previewProduct?.productWeight);
+  if (toPositiveNumberOrNull(merged?.weight_g) == null && previewWeight != null) {
+    merged.weight_g = previewWeight;
+  }
+
+  const previewPackLength = toPositiveNumberOrNull(previewProduct?.packLength);
+  if (toPositiveNumberOrNull(merged?.pack_length) == null && previewPackLength != null) {
+    merged.pack_length = previewPackLength;
+  }
+
+  const previewPackWidth = toPositiveNumberOrNull(previewProduct?.packWidth);
+  if (toPositiveNumberOrNull(merged?.pack_width) == null && previewPackWidth != null) {
+    merged.pack_width = previewPackWidth;
+  }
+
+  const previewPackHeight = toPositiveNumberOrNull(previewProduct?.packHeight);
+  if (toPositiveNumberOrNull(merged?.pack_height) == null && previewPackHeight != null) {
+    merged.pack_height = previewPackHeight;
+  }
+
+  const previewMaterial = isNonEmptyImportString(previewProduct?.material) ? previewProduct.material.trim() : '';
+  if (previewMaterial && !isNonEmptyImportString(merged?.material)) {
+    merged.material = previewMaterial;
+  }
+
+  const previewProductType = isNonEmptyImportString(previewProduct?.productType) ? previewProduct.productType.trim() : '';
+  if (previewProductType && !isNonEmptyImportString(merged?.product_type)) {
+    merged.product_type = previewProductType;
+  }
+
+  const previewOriginCountry = isNonEmptyImportString(previewProduct?.originCountry) ? previewProduct.originCountry.trim() : '';
+  if (previewOriginCountry && !isNonEmptyImportString(merged?.origin_country)) {
+    merged.origin_country = previewOriginCountry;
+  }
+
+  const previewHsCode = isNonEmptyImportString(previewProduct?.hsCode) ? previewProduct.hsCode.trim() : '';
+  if (previewHsCode && !isNonEmptyImportString(merged?.hs_code)) {
+    merged.hs_code = previewHsCode;
+  }
+
+  const previewProcessingHours = toPositiveNumberOrNull(previewProduct?.processingTimeHours);
+  if (toPositiveNumberOrNull(merged?.processing_days) == null && previewProcessingHours != null) {
+    merged.processing_days = Number((previewProcessingHours / 24).toFixed(2));
+  }
+
+  const deliveryRangeMatch = isNonEmptyImportString(previewProduct?.estimatedDeliveryDays)
+    ? previewProduct.estimatedDeliveryDays.match(/(\d+)\s*-\s*(\d+)/)
+    : null;
+  if (toPositiveNumberOrNull(merged?.delivery_days_min) == null && deliveryRangeMatch) {
+    merged.delivery_days_min = Number(deliveryRangeMatch[1]);
+  }
+
+  const previewDeliveryHours = toPositiveNumberOrNull(previewProduct?.deliveryTimeHours);
+  if (toPositiveNumberOrNull(merged?.delivery_days_max) == null && previewDeliveryHours != null) {
+    merged.delivery_days_max = Number((previewDeliveryHours / 24).toFixed(2));
+  }
+  if (toPositiveNumberOrNull(merged?.delivery_days_max) == null && deliveryRangeMatch) {
+    merged.delivery_days_max = Number(deliveryRangeMatch[2]);
+  }
+
   return merged;
 }
 
@@ -932,13 +1146,39 @@ function buildQueuePreviewSyncPatch(originalProduct: any, mergedProduct: any): R
     'name_en',
     'category',
     'category_name',
+    'description_en',
+    'overview',
+    'product_info',
+    'size_info',
+    'product_note',
+    'packing_list',
     'images',
+    'size_chart_images',
+    'color_image_map',
+    'video_url',
+    'video_source_url',
+    'video_4k_url',
+    'video_delivery_mode',
+    'video_quality_gate_passed',
+    'video_source_quality_hint',
     'variants',
     'variant_pricing',
     'available_colors',
     'available_sizes',
+    'available_models',
     'cj_price_usd',
     'stock_total',
+    'weight_g',
+    'pack_length',
+    'pack_width',
+    'pack_height',
+    'material',
+    'product_type',
+    'origin_country',
+    'hs_code',
+    'processing_days',
+    'delivery_days_min',
+    'delivery_days_max',
     'displayed_rating',
     'supplier_rating',
     'rating_confidence',
@@ -955,7 +1195,10 @@ function buildQueuePreviewSyncPatch(originalProduct: any, mergedProduct: any): R
   return patch;
 }
 
-async function fetchPreviewProductForImport(req: NextRequest, pid: string): Promise<any | null> {
+async function fetchPreviewProductForImport(
+  req: NextRequest,
+  pid: string
+): Promise<{ product: any; source: string } | null> {
   const normalizedPid = String(pid || '').trim();
   if (!normalizedPid) return null;
 
@@ -985,7 +1228,10 @@ async function fetchPreviewProductForImport(req: NextRequest, pid: string): Prom
     if (!res.ok) return null;
     const payload = await res.json();
     if (!payload?.ok || !payload?.product) return null;
-    return payload.product;
+    return {
+      product: payload.product,
+      source: typeof payload?.source === 'string' ? payload.source : 'unknown',
+    };
   } catch {
     return null;
   } finally {
@@ -993,18 +1239,39 @@ async function fetchPreviewProductForImport(req: NextRequest, pid: string): Prom
   }
 }
 
-async function syncQueueRowForImport(req: NextRequest, admin: any, queueRow: any): Promise<any> {
-  if (!isQueueRowLikelyStaleForImport(queueRow)) return queueRow;
+type QueueImportSyncResult = {
+  queueRow: any;
+  blockedUnavailable: boolean;
+  blockedReasonCode: string | null;
+};
 
+async function syncQueueRowForImport(req: NextRequest, admin: any, queueRow: any): Promise<QueueImportSyncResult> {
+  if (!isQueueRowLikelyStaleForImport(queueRow)) {
+    return { queueRow, blockedUnavailable: false, blockedReasonCode: null };
+  }
   const pid = String(queueRow?.cj_product_id || '').trim();
-  if (!pid) return queueRow;
+  if (!pid) {
+    await persistImportLiveSyncBlockedMarker(admin, queueRow, '', 'missing_pid');
+    return { queueRow, blockedUnavailable: true, blockedReasonCode: 'missing_pid' };
+  }
 
-  const previewProduct = await fetchPreviewProductForImport(req, pid);
-  if (!previewProduct) return queueRow;
+  const previewResult = await fetchPreviewProductForImport(req, pid);
+  if (!previewResult) {
+    await persistImportLiveSyncBlockedMarker(admin, queueRow, pid, 'preview_unavailable');
+    return { queueRow, blockedUnavailable: true, blockedReasonCode: 'preview_unavailable' };
+  }
 
-  const mergedProduct = mergeQueueImportRowWithPreview(queueRow, previewProduct);
+  if (!isLiveImportPreviewSource(previewResult.source)) {
+    const reasonCode = previewResult.source === 'queue_snapshot' ? 'snapshot_source' : 'non_live_source';
+    await persistImportLiveSyncBlockedMarker(admin, queueRow, pid, reasonCode);
+    return { queueRow, blockedUnavailable: true, blockedReasonCode: reasonCode };
+  }
+
+  const mergedProduct = mergeQueueImportRowWithPreview(queueRow, previewResult.product);
   const patch = buildQueuePreviewSyncPatch(queueRow, mergedProduct);
-  if (Object.keys(patch).length === 0) return mergedProduct;
+  if (Object.keys(patch).length === 0) {
+    return { queueRow: mergedProduct, blockedUnavailable: false, blockedReasonCode: null };
+  }
 
   const updatePayload = { ...patch, updated_at: new Date().toISOString() };
   try {
@@ -1031,7 +1298,7 @@ async function syncQueueRowForImport(req: NextRequest, admin: any, queueRow: any
     });
   }
 
-  return mergedProduct;
+  return { queueRow: mergedProduct, blockedUnavailable: false, blockedReasonCode: null };
 }
 
 export async function POST(req: NextRequest) {
@@ -1195,10 +1462,19 @@ export async function POST(req: NextRequest) {
 
     for (const qp of queueProducts) {
       try {
+        let importBlockedReason: string | null = null;
         try {
-          const syncedQueueRow = await syncQueueRowForImport(req, admin, qp);
-          if (syncedQueueRow && typeof syncedQueueRow === 'object') {
-            Object.assign(qp, syncedQueueRow);
+          const syncResult = await syncQueueRowForImport(req, admin, qp);
+          if (syncResult?.queueRow && typeof syncResult.queueRow === 'object') {
+            Object.assign(qp, syncResult.queueRow);
+          }
+          const stillStaleForImport = isQueueRowLikelyStaleForImport(qp);
+          if (stillStaleForImport) {
+            if (syncResult?.blockedUnavailable) {
+              importBlockedReason = `Import blocked: live CJ sync unavailable (${syncResult.blockedReasonCode || 'live_sync_unavailable'}).`;
+            } else {
+              importBlockedReason = 'Import blocked: queue row remains stale after live CJ sync.';
+            }
           }
         } catch (presyncError: any) {
           console.warn('[Import Execute] Queue pre-sync warning:', {
@@ -1206,6 +1482,31 @@ export async function POST(req: NextRequest) {
             pid: qp?.cj_product_id,
             error: presyncError?.message || String(presyncError),
           });
+          importBlockedReason = 'Import blocked: live CJ pre-sync failed.';
+        }
+
+        if (importBlockedReason) {
+          const currentNotes = typeof qp?.admin_notes === 'string' ? qp.admin_notes.trim() : '';
+          const nextNotes = currentNotes.includes(importBlockedReason)
+            ? currentNotes
+            : (currentNotes ? `${currentNotes}\n${importBlockedReason}` : importBlockedReason);
+          try {
+            await admin
+              .from('product_queue')
+              .update({
+                admin_notes: nextNotes,
+                updated_at: new Date().toISOString(),
+              })
+              .eq('id', qp.id);
+          } catch (noteError: any) {
+            console.warn('[Import Execute] Failed to persist blocked import note:', {
+              id: qp?.id,
+              pid: qp?.cj_product_id,
+              error: noteError?.message || String(noteError),
+            });
+          }
+          results.push({ id: qp.id, success: false, error: importBlockedReason });
+          continue;
         }
 
         requireField(qp.cj_product_id, 'pid');

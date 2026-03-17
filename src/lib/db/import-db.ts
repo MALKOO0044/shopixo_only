@@ -114,7 +114,104 @@ function normalizeQueueRatingValue(value: unknown): number | null {
 
 }
 
+const IMPORT_QUEUE_PLACEHOLDER_CATEGORY_TOKENS = new Set([
+  'general',
+  'uncategorized',
+  'unknown',
+  'misc',
+  'others',
+]);
+const IMPORT_QUEUE_INGESTION_BLOCK_PREFIX = 'INGESTION_FIDELITY_BLOCKED';
 
+function isPlaceholderQueueNameForInsert(value: unknown): boolean {
+  if (typeof value !== 'string') return true;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return true;
+  if (/^cj product\b/.test(normalized)) return true;
+  if (/^unavailable cj product\b/.test(normalized)) return true;
+  if (/^unknown product\b/.test(normalized)) return true;
+  return false;
+}
+
+function isPlaceholderQueueCategoryForInsert(value: unknown): boolean {
+  if (typeof value !== 'string') return true;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return true;
+  return IMPORT_QUEUE_PLACEHOLDER_CATEGORY_TOKENS.has(normalized);
+}
+
+function hasMeaningfulQueueInsertVariantData(variants: any[]): boolean {
+  return variants.some((variant: any) => {
+    if (!variant || typeof variant !== 'object') return false;
+    const variantSku = typeof variant?.variantSku === 'string' ? variant.variantSku.trim() : '';
+    if (!variantSku) return false;
+
+    const sellPriceSar = Number(
+      variant?.sellPriceSAR ??
+      variant?.price ??
+      variant?.sellPriceSar
+    );
+    if (!Number.isFinite(sellPriceSar) || sellPriceSar <= 0) return false;
+
+    const stock = Number(
+      variant?.stock ??
+      variant?.totalStock ??
+      (Number(variant?.cjStock || 0) + Number(variant?.factoryStock || 0))
+    );
+    const hasStock = Number.isFinite(stock) && stock > 0;
+    const hasDimensions = typeof variant?.color === 'string' || typeof variant?.size === 'string';
+    return hasStock || hasDimensions;
+  });
+}
+
+function parseQueueJsonArray(value: unknown): any[] {
+  if (Array.isArray(value)) return value;
+  if (typeof value !== 'string') return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseQueueJsonObject(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value !== 'string') return null;
+  try {
+    const parsed = JSON.parse(value);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function isQueueRowHighFidelityForDowngradeGuard(row: any): boolean {
+  if (!row || typeof row !== 'object') return false;
+
+  const rowName = typeof row?.name_en === 'string' ? row.name_en.trim() : '';
+  const rowCategory = (
+    (typeof row?.category_name === 'string' && row.category_name.trim()) ||
+    (typeof row?.category === 'string' && row.category.trim()) ||
+    ''
+  );
+
+  const rowImagesRaw = parseQueueJsonArray(row?.images);
+  const rowImages = rowImagesRaw.filter((imageUrl) => typeof imageUrl === 'string' && /^https?:\/\//i.test(imageUrl.trim()));
+  const rowColorImageMap = parseQueueJsonObject(row?.color_image_map);
+  const rowVariants = parseQueueJsonArray(row?.variants);
+
+  const hasRealName = !isPlaceholderQueueNameForInsert(rowName);
+  const hasRealCategory = !isPlaceholderQueueCategoryForInsert(rowCategory);
+  const hasRealGallery = rowImages.length > 0 || Boolean(rowColorImageMap && Object.keys(rowColorImageMap).length > 0);
+  const hasRealVariants = hasMeaningfulQueueInsertVariantData(rowVariants);
+  return hasRealName && hasRealCategory && hasRealGallery && hasRealVariants;
+}
 
 function extractMissingColumnNames(error: any): string[] {
 
@@ -574,7 +671,12 @@ export async function addProductToQueue(batchId: number, product: {
 
   schemaCheck?: Awaited<ReturnType<typeof checkProductQueueSchema>>;
 
-}): Promise<{ success: boolean; error?: string }> {
+}): Promise<{
+  success: boolean;
+  error?: string;
+  blockedUnavailable?: boolean;
+  skippedLowQualityDowngrade?: boolean;
+}> {
 
   const supabase = getSupabaseAdmin();
 
@@ -723,6 +825,25 @@ export async function addProductToQueue(batchId: number, product: {
     return entries.length > 0 ? Object.fromEntries(entries) : null;
 
   })();
+
+  const normalizedName = typeof product.name === 'string' ? product.name.trim() : '';
+  const normalizedCategory =
+    (typeof product.categoryName === 'string' && product.categoryName.trim()) ||
+    (typeof product.category === 'string' && product.category.trim()) ||
+    '';
+  const hasRealName = !isPlaceholderQueueNameForInsert(normalizedName);
+  const hasRealCategory = !isPlaceholderQueueCategoryForInsert(normalizedCategory);
+  const hasRealGallery = normalizedQueueImages.length > 0 || Boolean(normalizedColorImageMap && Object.keys(normalizedColorImageMap).length > 0);
+  const hasRealVariants = hasMeaningfulQueueInsertVariantData(Array.isArray(product.variants) ? product.variants : []);
+  const failedChecks: string[] = [];
+  if (!hasRealName) failedChecks.push('name');
+  if (!hasRealCategory) failedChecks.push('category');
+  if (!hasRealGallery) failedChecks.push('images');
+  if (!hasRealVariants) failedChecks.push('variants');
+  const isLowQualityCandidate = failedChecks.length > 0;
+  const ingestionBlockedMessage = isLowQualityCandidate
+    ? `${IMPORT_QUEUE_INGESTION_BLOCK_PREFIX}:${failedChecks.join(',')}:${new Date().toISOString()}`
+    : null;
 
 
 
@@ -916,9 +1037,9 @@ export async function addProductToQueue(batchId: number, product: {
 
     supabase_category_slug: product.supabaseCategorySlug || null,
 
-    inventory_status: product.inventoryStatus || null,
+    inventory_status: isLowQualityCandidate ? 'blocked_unavailable' : (product.inventoryStatus || null),
 
-    inventory_error_message: product.inventoryErrorMessage || null,
+    inventory_error_message: isLowQualityCandidate ? ingestionBlockedMessage : (product.inventoryErrorMessage || null),
 
   };
 
@@ -1004,13 +1125,17 @@ export async function addProductToQueue(batchId: number, product: {
 
 
 
-  const writeProductQueue = async (payload: Record<string, any>) => {
+  const writeProductQueue = async (payload: Record<string, any>): Promise<{
+    error: any;
+    skippedLowQualityDowngrade: boolean;
+    blockedUnavailable: boolean;
+  }> => {
 
     const { data: existing } = await supabase
 
       .from('product_queue')
 
-      .select('id')
+      .select('id, name_en, category, category_name, images, variants, color_image_map')
 
       .eq('cj_product_id', product.productId)
 
@@ -1019,8 +1144,14 @@ export async function addProductToQueue(batchId: number, product: {
 
 
     if (existing) {
-
-      return await supabase
+      if (isLowQualityCandidate && isQueueRowHighFidelityForDowngradeGuard(existing)) {
+        return {
+          error: null,
+          skippedLowQualityDowngrade: true,
+          blockedUnavailable: false,
+        };
+      }
+      const updateResult = await supabase
 
         .from('product_queue')
 
@@ -1028,15 +1159,27 @@ export async function addProductToQueue(batchId: number, product: {
 
         .eq('cj_product_id', product.productId);
 
+      return {
+        error: updateResult.error,
+        skippedLowQualityDowngrade: false,
+        blockedUnavailable: isLowQualityCandidate,
+      };
+
     }
 
 
 
-    return await supabase
+    const insertResult = await supabase
 
       .from('product_queue')
 
       .insert(payload);
+
+    return {
+      error: insertResult.error,
+      skippedLowQualityDowngrade: false,
+      blockedUnavailable: isLowQualityCandidate,
+    };
 
   };
 
@@ -1044,7 +1187,10 @@ export async function addProductToQueue(batchId: number, product: {
 
   let payloadForWrite: Record<string, any> = { ...productData };
 
-  let { error } = await writeProductQueue(payloadForWrite);
+  let writeResult = await writeProductQueue(payloadForWrite);
+  let error = writeResult.error;
+  let skippedLowQualityDowngrade = writeResult.skippedLowQualityDowngrade;
+  let blockedUnavailable = writeResult.blockedUnavailable;
 
 
 
@@ -1110,9 +1256,11 @@ export async function addProductToQueue(batchId: number, product: {
 
       payloadForWrite = retryPayload;
 
-      const retryResult = await writeProductQueue(payloadForWrite);
+      writeResult = await writeProductQueue(payloadForWrite);
 
-      error = retryResult.error;
+      error = writeResult.error;
+      skippedLowQualityDowngrade = writeResult.skippedLowQualityDowngrade;
+      blockedUnavailable = writeResult.blockedUnavailable;
 
     }
 
@@ -1190,7 +1338,11 @@ export async function addProductToQueue(batchId: number, product: {
 
 
 
-  return { success: true };
+  return {
+    success: true,
+    blockedUnavailable,
+    skippedLowQualityDowngrade,
+  };
 
 }
 

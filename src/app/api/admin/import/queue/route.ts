@@ -390,6 +390,77 @@ function derivePreviewBaseCostUsd(previewProduct: any, previewVariantPricing: an
   return minPriceUSD ?? 0;
 }
 
+const QUEUE_LIVE_SYNC_BLOCK_PREFIX = "LIVE_SYNC_BLOCKED";
+
+function buildQueueLiveSyncBlockMessage(reasonCode: string): string {
+  return `${QUEUE_LIVE_SYNC_BLOCK_PREFIX}:${reasonCode}:${new Date().toISOString()}`;
+}
+
+function isLivePreviewSource(source: unknown): boolean {
+  return String(source || "").trim().toLowerCase() === "cj_live";
+}
+
+async function persistQueueLiveSyncBlockedMarker(
+  supabase: any,
+  product: any,
+  pid: string,
+  reasonCode: string
+): Promise<{ updated: boolean; failed: boolean }> {
+  const reasonToken = `${QUEUE_LIVE_SYNC_BLOCK_PREFIX}:${reasonCode}:`;
+  const currentStatus = String(product?.inventory_status || "").trim().toLowerCase();
+  const currentError = typeof product?.inventory_error_message === "string" ? product.inventory_error_message : "";
+
+  if (currentStatus === "blocked_unavailable" && currentError.includes(reasonToken)) {
+    return { updated: false, failed: false };
+  }
+
+  const payload: Record<string, any> = {
+    updated_at: new Date().toISOString(),
+  };
+
+  if (currentStatus !== "blocked_unavailable") {
+    payload.inventory_status = "blocked_unavailable";
+  }
+  if (!currentError.includes(reasonToken)) {
+    payload.inventory_error_message = buildQueueLiveSyncBlockMessage(reasonCode);
+  }
+
+  if (Object.keys(payload).length <= 1) {
+    return { updated: false, failed: false };
+  }
+
+  try {
+    let updateQuery = supabase.from("product_queue").update(payload);
+    const numericId = Number(product?.id);
+    if (Number.isFinite(numericId) && numericId > 0) {
+      updateQuery = updateQuery.eq("id", numericId);
+    } else if (pid) {
+      updateQuery = updateQuery.eq("cj_product_id", pid);
+    } else {
+      return { updated: false, failed: false };
+    }
+    const { error } = await updateQuery;
+    if (error) {
+      console.warn("[Queue Sync] Failed to persist blocked marker:", {
+        id: product?.id,
+        pid,
+        reasonCode,
+        error: error.message,
+      });
+      return { updated: false, failed: true };
+    }
+    return { updated: true, failed: false };
+  } catch (persistError: any) {
+    console.warn("[Queue Sync] Exception while persisting blocked marker:", {
+      id: product?.id,
+      pid,
+      reasonCode,
+      error: persistError?.message || String(persistError),
+    });
+    return { updated: false, failed: true };
+  }
+}
+
 function mergeQueueProductWithPreview(baseProduct: any, previewProduct: any): any {
   if (!previewProduct || typeof previewProduct !== "object") return baseProduct;
 
@@ -412,6 +483,38 @@ function mergeQueueProductWithPreview(baseProduct: any, previewProduct: any): an
   const previewImages = normalizeQueueImages(previewProduct?.images);
   if (previewImages.length > 0 && normalizeQueueImages(merged?.images).length === 0) {
     merged.images = previewImages;
+  }
+
+  const previewVideo4k = normalizeHttpUrl(previewProduct?.video4kUrl);
+  if (previewVideo4k && !normalizeHttpUrl(merged?.video_4k_url)) {
+    merged.video_4k_url = previewVideo4k;
+  }
+
+  const previewVideo = normalizeHttpUrl(previewProduct?.videoUrl) || previewVideo4k;
+  if (previewVideo && !normalizeHttpUrl(merged?.video_url)) {
+    merged.video_url = previewVideo;
+  }
+
+  const previewVideoSource = normalizeHttpUrl(previewProduct?.videoSourceUrl);
+  if (previewVideoSource && !normalizeHttpUrl(merged?.video_source_url)) {
+    merged.video_source_url = previewVideoSource;
+  }
+
+  const previewVideoMode = String(previewProduct?.videoDeliveryMode || "").trim();
+  if (!isNonEmptyString(merged?.video_delivery_mode) && /^(native|enhanced|passthrough)$/i.test(previewVideoMode)) {
+    merged.video_delivery_mode = previewVideoMode.toLowerCase();
+  }
+
+  if (typeof merged?.video_quality_gate_passed !== "boolean" && typeof previewProduct?.videoQualityGatePassed === "boolean") {
+    merged.video_quality_gate_passed = previewProduct.videoQualityGatePassed;
+  }
+
+  const previewQualityHint = String(previewProduct?.videoSourceQualityHint || "").trim().toLowerCase();
+  if (
+    !isNonEmptyString(merged?.video_source_quality_hint) &&
+    /^(4k|hd|sd|unknown)$/.test(previewQualityHint)
+  ) {
+    merged.video_source_quality_hint = previewQualityHint;
   }
 
   const previewVariants = Array.isArray(previewProduct?.variants) ? previewProduct.variants : [];
@@ -445,6 +548,16 @@ function mergeQueueProductWithPreview(baseProduct: any, previewProduct: any): an
   }
   if (previewSizes.length > 0 && parseQueueStringArray(merged?.available_sizes).length === 0) {
     merged.available_sizes = Array.from(new Set(previewSizes));
+  }
+
+  const previewModels = parseQueueStringArray(previewProduct?.availableModels);
+  if (previewModels.length > 0 && parseQueueStringArray(merged?.available_models).length === 0) {
+    merged.available_models = Array.from(new Set(previewModels));
+  }
+
+  const previewColorImageMap = normalizeQueueColorImageMap(previewProduct?.colorImageMap);
+  if (previewColorImageMap && !normalizeQueueColorImageMap(merged?.color_image_map)) {
+    merged.color_image_map = previewColorImageMap;
   }
 
   const previewBaseCostUsd = derivePreviewBaseCostUsd(previewProduct, previewVariantPricing, previewVariants);
@@ -486,6 +599,101 @@ function mergeQueueProductWithPreview(baseProduct: any, previewProduct: any): an
     merged.cj_sku = previewProduct.cjSku.trim();
   }
 
+  const previewDescription = isNonEmptyString(previewProduct?.description) ? previewProduct.description.trim() : "";
+  if (previewDescription && !isNonEmptyString(merged?.description_en)) {
+    merged.description_en = previewDescription;
+  }
+
+  const previewOverview = isNonEmptyString(previewProduct?.overview) ? previewProduct.overview.trim() : "";
+  if (previewOverview && !isNonEmptyString(merged?.overview)) {
+    merged.overview = previewOverview;
+  }
+
+  const previewProductInfo = isNonEmptyString(previewProduct?.productInfo) ? previewProduct.productInfo.trim() : "";
+  if (previewProductInfo && !isNonEmptyString(merged?.product_info)) {
+    merged.product_info = previewProductInfo;
+  }
+
+  const previewSizeInfo = isNonEmptyString(previewProduct?.sizeInfo) ? previewProduct.sizeInfo.trim() : "";
+  if (previewSizeInfo && !isNonEmptyString(merged?.size_info)) {
+    merged.size_info = previewSizeInfo;
+  }
+
+  const previewProductNote = isNonEmptyString(previewProduct?.productNote) ? previewProduct.productNote.trim() : "";
+  if (previewProductNote && !isNonEmptyString(merged?.product_note)) {
+    merged.product_note = previewProductNote;
+  }
+
+  const previewPackingList = isNonEmptyString(previewProduct?.packingList) ? previewProduct.packingList.trim() : "";
+  if (previewPackingList && !isNonEmptyString(merged?.packing_list)) {
+    merged.packing_list = previewPackingList;
+  }
+
+  const previewSizeChartImages = normalizeQueueImages(previewProduct?.sizeChartImages);
+  if (previewSizeChartImages.length > 0 && normalizeQueueImages(merged?.size_chart_images).length === 0) {
+    merged.size_chart_images = previewSizeChartImages;
+  }
+
+  const previewWeight = toPositiveNumberOrNull(previewProduct?.productWeight);
+  if (!(toPositiveNumberOrNull(merged?.weight_g) != null) && previewWeight != null) {
+    merged.weight_g = previewWeight;
+  }
+
+  const previewPackLength = toPositiveNumberOrNull(previewProduct?.packLength);
+  if (!(toPositiveNumberOrNull(merged?.pack_length) != null) && previewPackLength != null) {
+    merged.pack_length = previewPackLength;
+  }
+
+  const previewPackWidth = toPositiveNumberOrNull(previewProduct?.packWidth);
+  if (!(toPositiveNumberOrNull(merged?.pack_width) != null) && previewPackWidth != null) {
+    merged.pack_width = previewPackWidth;
+  }
+
+  const previewPackHeight = toPositiveNumberOrNull(previewProduct?.packHeight);
+  if (!(toPositiveNumberOrNull(merged?.pack_height) != null) && previewPackHeight != null) {
+    merged.pack_height = previewPackHeight;
+  }
+
+  const previewMaterial = isNonEmptyString(previewProduct?.material) ? previewProduct.material.trim() : "";
+  if (previewMaterial && !isNonEmptyString(merged?.material)) {
+    merged.material = previewMaterial;
+  }
+
+  const previewProductType = isNonEmptyString(previewProduct?.productType) ? previewProduct.productType.trim() : "";
+  if (previewProductType && !isNonEmptyString(merged?.product_type)) {
+    merged.product_type = previewProductType;
+  }
+
+  const previewOriginCountry = isNonEmptyString(previewProduct?.originCountry) ? previewProduct.originCountry.trim() : "";
+  if (previewOriginCountry && !isNonEmptyString(merged?.origin_country)) {
+    merged.origin_country = previewOriginCountry;
+  }
+
+  const previewHsCode = isNonEmptyString(previewProduct?.hsCode) ? previewProduct.hsCode.trim() : "";
+  if (previewHsCode && !isNonEmptyString(merged?.hs_code)) {
+    merged.hs_code = previewHsCode;
+  }
+
+  const previewProcessingHours = toPositiveNumberOrNull(previewProduct?.processingTimeHours);
+  if (!(toPositiveNumberOrNull(merged?.processing_days) != null) && previewProcessingHours != null) {
+    merged.processing_days = Number((previewProcessingHours / 24).toFixed(2));
+  }
+
+  const deliveryRangeMatch = isNonEmptyString(previewProduct?.estimatedDeliveryDays)
+    ? previewProduct.estimatedDeliveryDays.match(/(\d+)\s*-\s*(\d+)/)
+    : null;
+  if (!(toPositiveNumberOrNull(merged?.delivery_days_min) != null) && deliveryRangeMatch) {
+    merged.delivery_days_min = Number(deliveryRangeMatch[1]);
+  }
+
+  const previewDeliveryHours = toPositiveNumberOrNull(previewProduct?.deliveryTimeHours);
+  if (!(toPositiveNumberOrNull(merged?.delivery_days_max) != null) && previewDeliveryHours != null) {
+    merged.delivery_days_max = Number((previewDeliveryHours / 24).toFixed(2));
+  }
+  if (!(toPositiveNumberOrNull(merged?.delivery_days_max) != null) && deliveryRangeMatch) {
+    merged.delivery_days_max = Number(deliveryRangeMatch[2]);
+  }
+
   return merged;
 }
 
@@ -506,13 +714,39 @@ function buildEnrichmentPatch(originalProduct: any, mergedProduct: any): Record<
     "name_en",
     "category",
     "category_name",
+    "description_en",
+    "overview",
+    "product_info",
+    "size_info",
+    "product_note",
+    "packing_list",
     "images",
+    "size_chart_images",
+    "color_image_map",
+    "video_url",
+    "video_source_url",
+    "video_4k_url",
+    "video_delivery_mode",
+    "video_quality_gate_passed",
+    "video_source_quality_hint",
     "variants",
     "variant_pricing",
     "available_colors",
     "available_sizes",
+    "available_models",
     "cj_price_usd",
     "stock_total",
+    "weight_g",
+    "pack_length",
+    "pack_width",
+    "pack_height",
+    "material",
+    "product_type",
+    "origin_country",
+    "hs_code",
+    "processing_days",
+    "delivery_days_min",
+    "delivery_days_max",
     "displayed_rating",
     "supplier_rating",
     "rating_confidence",
@@ -529,7 +763,10 @@ function buildEnrichmentPatch(originalProduct: any, mergedProduct: any): Record<
   return patch;
 }
 
-async function fetchPreviewProductForQueue(req: NextRequest, pid: string): Promise<any | null> {
+async function fetchPreviewProductForQueue(
+  req: NextRequest,
+  pid: string
+): Promise<{ product: any; source: string } | null> {
   const normalizedPid = String(pid || "").trim();
   if (!normalizedPid) return null;
 
@@ -554,7 +791,10 @@ async function fetchPreviewProductForQueue(req: NextRequest, pid: string): Promi
     if (!res.ok) return null;
     const payload = await res.json();
     if (!payload?.ok || !payload?.product) return null;
-    return payload.product;
+    return {
+      product: payload.product,
+      source: typeof payload?.source === "string" ? payload.source : "unknown",
+    };
   } catch {
     return null;
   } finally {
@@ -566,7 +806,10 @@ type QueueEnrichmentStats = {
   scannedRows: number;
   staleRows: number;
   previewHits: number;
+  liveHits: number;
+  snapshotHitsSkipped: number;
   previewMisses: number;
+  blockedUnavailableRows: number;
   mergedRows: number;
   persistedRows: number;
   persistFailures: number;
@@ -589,7 +832,10 @@ async function enrichQueueRowsWithStats(
     scannedRows: rawProducts.length,
     staleRows: 0,
     previewHits: 0,
+    liveHits: 0,
+    snapshotHitsSkipped: 0,
     previewMisses: 0,
+    blockedUnavailableRows: 0,
     mergedRows: 0,
     persistedRows: 0,
     persistFailures: 0,
@@ -618,14 +864,56 @@ async function enrichQueueRowsWithStats(
       batchIndexes.map(async (index) => {
         const currentRaw = rawProducts[index];
         const pid = String(currentRaw?.cj_product_id || "").trim();
-        if (!pid) return { previewHit: false, merged: false, persisted: false, persistFailed: false } as const;
-
-        const previewProduct = await fetchPreviewProductForQueue(req, pid);
-        if (!previewProduct) {
-          return { previewHit: false, merged: false, persisted: false, persistFailed: false } as const;
+        if (!pid) {
+          let markerPersistFailed = false;
+          if (shouldPersist) {
+            const marker = await persistQueueLiveSyncBlockedMarker(supabase, currentRaw, "", "missing_pid");
+            markerPersistFailed = marker.failed;
+          }
+          return {
+            previewState: "miss",
+            merged: false,
+            persisted: false,
+            persistFailed: markerPersistFailed,
+            blockedUnavailable: true,
+          } as const;
         }
 
-        const mergedProduct = mergeQueueProductWithPreview(currentRaw, previewProduct);
+        const previewResult = await fetchPreviewProductForQueue(req, pid);
+        if (!previewResult) {
+          let markerPersistFailed = false;
+          if (shouldPersist) {
+            const marker = await persistQueueLiveSyncBlockedMarker(supabase, currentRaw, pid, "preview_unavailable");
+            markerPersistFailed = marker.failed;
+          }
+          return {
+            previewState: "miss",
+            merged: false,
+            persisted: false,
+            persistFailed: markerPersistFailed,
+            blockedUnavailable: true,
+          } as const;
+        }
+
+        if (!isLivePreviewSource(previewResult.source)) {
+          let markerPersistFailed = false;
+          if (shouldPersist) {
+            const reasonCode = previewResult.source === "queue_snapshot"
+              ? "snapshot_source"
+              : "non_live_source";
+            const marker = await persistQueueLiveSyncBlockedMarker(supabase, currentRaw, pid, reasonCode);
+            markerPersistFailed = marker.failed;
+          }
+          return {
+            previewState: "snapshot",
+            merged: false,
+            persisted: false,
+            persistFailed: markerPersistFailed,
+            blockedUnavailable: true,
+          } as const;
+        }
+
+        const mergedProduct = mergeQueueProductWithPreview(currentRaw, previewResult.product);
         const patch = buildEnrichmentPatch(currentRaw, mergedProduct);
         const hasPatch = Object.keys(patch).length > 0;
         let persisted = false;
@@ -662,10 +950,11 @@ async function enrichQueueRowsWithStats(
           }
         }
         return {
-          previewHit: true,
+          previewState: "live",
           merged: hasPatch,
           persisted,
           persistFailed,
+          blockedUnavailable: false,
           index,
           mergedProduct,
         } as const;
@@ -674,8 +963,15 @@ async function enrichQueueRowsWithStats(
 
     for (const result of batchResults) {
       if (!result) continue;
-      if (result.previewHit) stats.previewHits += 1;
-      else stats.previewMisses += 1;
+      if (result.previewState === "live") {
+        stats.previewHits += 1;
+        stats.liveHits += 1;
+      } else if (result.previewState === "snapshot") {
+        stats.snapshotHitsSkipped += 1;
+      } else {
+        stats.previewMisses += 1;
+      }
+      if (result.blockedUnavailable) stats.blockedUnavailableRows += 1;
       if (result.merged) stats.mergedRows += 1;
       if (result.persisted) stats.persistedRows += 1;
       if (result.persistFailed) stats.persistFailures += 1;
@@ -908,7 +1204,10 @@ export async function PATCH(req: NextRequest) {
           updated: result.stats.mergedRows,
           persisted: result.stats.persistedRows,
           previewHits: result.stats.previewHits,
+          liveHits: result.stats.liveHits,
+          snapshotHitsSkipped: result.stats.snapshotHitsSkipped,
           previewMisses: result.stats.previewMisses,
+          blockedUnavailable: result.stats.blockedUnavailableRows,
           persistFailures: result.stats.persistFailures,
         });
       } catch (backfillError: any) {
