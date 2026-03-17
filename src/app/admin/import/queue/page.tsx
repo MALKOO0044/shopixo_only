@@ -318,9 +318,39 @@ type QueueBackfillProgress = {
   persisted: number;
   previewMisses: number;
   persistFailures: number;
+  reasonCounts: Record<string, number>;
   cursor: number | null;
   error: string | null;
 };
+
+function normalizeBackfillReasonCounts(value: unknown): Record<string, number> {
+  if (!value || typeof value !== "object") return {};
+  const entries = Object.entries(value as Record<string, unknown>);
+  const output: Record<string, number> = {};
+  for (const [key, raw] of entries) {
+    const normalizedKey = String(key || "").trim().toLowerCase();
+    const parsedValue = Number(raw);
+    if (!normalizedKey || !Number.isFinite(parsedValue) || parsedValue <= 0) continue;
+    output[normalizedKey] = Math.floor(parsedValue);
+  }
+  return output;
+}
+
+function mergeBackfillReasonCounts(
+  baseCounts: Record<string, number>,
+  incomingCounts: Record<string, number>
+): Record<string, number> {
+  if (Object.keys(incomingCounts).length === 0) return baseCounts;
+  const merged: Record<string, number> = { ...baseCounts };
+  for (const [reason, count] of Object.entries(incomingCounts)) {
+    merged[reason] = (merged[reason] || 0) + count;
+  }
+  return merged;
+}
+
+function formatBackfillReasonLabel(reason: string): string {
+  return reason.replace(/_/g, " ");
+}
 
 type SchemaRemediation = {
   ready: boolean;
@@ -381,6 +411,7 @@ export default function QueuePage() {
     persisted: 0,
     previewMisses: 0,
     persistFailures: 0,
+    reasonCounts: {},
     cursor: null,
     error: null,
   });
@@ -457,6 +488,7 @@ export default function QueuePage() {
         const persisted = Number.isFinite(Number(data.persisted)) ? Number(data.persisted) : 0;
         const previewMisses = Number.isFinite(Number(data.previewMisses)) ? Number(data.previewMisses) : 0;
         const persistFailures = Number.isFinite(Number(data.persistFailures)) ? Number(data.persistFailures) : 0;
+        const reasonCounts = normalizeBackfillReasonCounts(data.reasonCounts);
 
         if (updated > 0 || persisted > 0) {
           shouldRefreshProducts = true;
@@ -480,6 +512,7 @@ export default function QueuePage() {
           persisted: prev.persisted + persisted,
           previewMisses: prev.previewMisses + previewMisses,
           persistFailures: prev.persistFailures + persistFailures,
+          reasonCounts: mergeBackfillReasonCounts(prev.reasonCounts, reasonCounts),
           error: null,
         }));
 
@@ -843,6 +876,9 @@ export default function QueuePage() {
   };
 
   const totalPages = Math.ceil(total / limit);
+  const backfillReasonEntries = Object.entries(backfillProgress.reasonCounts)
+    .filter(([, count]) => Number.isFinite(Number(count)) && Number(count) > 0)
+    .sort((a, b) => Number(b[1]) - Number(a[1]));
 
   return (
     <div className="space-y-6">
@@ -968,6 +1004,11 @@ export default function QueuePage() {
         {(backfillProgress.previewMisses > 0 || backfillProgress.persistFailures > 0) && (
           <p className="mt-1 text-blue-800">
             Preview misses: {backfillProgress.previewMisses.toLocaleString()} · Persist failures: {backfillProgress.persistFailures.toLocaleString()}
+          </p>
+        )}
+        {backfillReasonEntries.length > 0 && (
+          <p className="mt-1 text-blue-800">
+            Reasons: {backfillReasonEntries.map(([reason, count]) => `${formatBackfillReasonLabel(reason)}: ${Number(count).toLocaleString()}`).join(" · ")}
           </p>
         )}
         {backfillProgress.error && (

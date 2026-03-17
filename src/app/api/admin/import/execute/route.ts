@@ -1195,18 +1195,43 @@ function buildQueuePreviewSyncPatch(originalProduct: any, mergedProduct: any): R
   return patch;
 }
 
+type ImportPreviewFetchResult =
+  | { ok: true; product: any; source: string }
+  | { ok: false; source: string; reasonCode: string };
+
+function deriveImportPreviewUnavailableReason(status: number, payload: any): string {
+  const source = String(payload?.source || '').trim().toLowerCase();
+  const errorText = String(payload?.error || '').trim().toLowerCase();
+
+  if (source === 'cj_unavailable') {
+    if (status === 404 || errorText.includes('not found')) {
+      return 'cj_product_not_found';
+    }
+    if (status === 401 || status === 403 || errorText.includes('authenticate')) {
+      return 'cj_auth_unavailable';
+    }
+    return 'cj_unavailable';
+  }
+
+  if (status === 404) return 'preview_not_found';
+  if (status >= 500) return 'preview_http_5xx';
+  return 'preview_http_error';
+}
+
 async function fetchPreviewProductForImport(
   req: NextRequest,
   pid: string
-): Promise<{ product: any; source: string } | null> {
+): Promise<ImportPreviewFetchResult> {
   const normalizedPid = String(pid || '').trim();
-  if (!normalizedPid) return null;
+  if (!normalizedPid) {
+    return { ok: false, source: '', reasonCode: 'missing_pid' };
+  }
 
   let origin: string;
   try {
     origin = req.nextUrl?.origin || new URL(req.url).origin;
   } catch {
-    return null;
+    return { ok: false, source: '', reasonCode: 'preview_origin_missing' };
   }
 
   const controller = new AbortController();
@@ -1225,15 +1250,36 @@ async function fetchPreviewProductForImport(
         },
       }
     );
-    if (!res.ok) return null;
-    const payload = await res.json();
-    if (!payload?.ok || !payload?.product) return null;
+    let payload: any = null;
+    try {
+      payload = await res.json();
+    } catch {
+      payload = null;
+    }
+    if (!res.ok) {
+      return {
+        ok: false,
+        source: typeof payload?.source === 'string' ? payload.source : '',
+        reasonCode: deriveImportPreviewUnavailableReason(res.status, payload),
+      };
+    }
+    if (!payload?.ok || !payload?.product) {
+      return {
+        ok: false,
+        source: typeof payload?.source === 'string' ? payload.source : '',
+        reasonCode: 'preview_invalid_payload',
+      };
+    }
     return {
+      ok: true,
       product: payload.product,
       source: typeof payload?.source === 'string' ? payload.source : 'unknown',
     };
-  } catch {
-    return null;
+  } catch (error: any) {
+    const reasonCode = String(error?.name || '').trim() === 'AbortError'
+      ? 'preview_timeout'
+      : 'preview_fetch_error';
+    return { ok: false, source: '', reasonCode };
   } finally {
     clearTimeout(timeout);
   }
@@ -1256,9 +1302,10 @@ async function syncQueueRowForImport(req: NextRequest, admin: any, queueRow: any
   }
 
   const previewResult = await fetchPreviewProductForImport(req, pid);
-  if (!previewResult) {
-    await persistImportLiveSyncBlockedMarker(admin, queueRow, pid, 'preview_unavailable');
-    return { queueRow, blockedUnavailable: true, blockedReasonCode: 'preview_unavailable' };
+  if (!previewResult.ok) {
+    const reasonCode = previewResult.reasonCode || 'preview_unavailable';
+    await persistImportLiveSyncBlockedMarker(admin, queueRow, pid, reasonCode);
+    return { queueRow, blockedUnavailable: true, blockedReasonCode: reasonCode };
   }
 
   if (!isLiveImportPreviewSource(previewResult.source)) {

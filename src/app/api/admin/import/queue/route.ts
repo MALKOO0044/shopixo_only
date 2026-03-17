@@ -763,15 +763,48 @@ function buildEnrichmentPatch(originalProduct: any, mergedProduct: any): Record<
   return patch;
 }
 
+type QueuePreviewFetchResult =
+  | { ok: true; product: any; source: string }
+  | { ok: false; source: string; reasonCode: string };
+
+function deriveQueuePreviewUnavailableReason(status: number, payload: any): string {
+  const source = String(payload?.source || "").trim().toLowerCase();
+  const errorText = String(payload?.error || "").trim().toLowerCase();
+
+  if (source === "cj_unavailable") {
+    if (status === 404 || errorText.includes("not found")) {
+      return "cj_product_not_found";
+    }
+    if (status === 401 || status === 403 || errorText.includes("authenticate")) {
+      return "cj_auth_unavailable";
+    }
+    return "cj_unavailable";
+  }
+
+  if (status === 404) return "preview_not_found";
+  if (status >= 500) return "preview_http_5xx";
+  return "preview_http_error";
+}
+
+function incrementQueueReasonCount(stats: QueueEnrichmentStats, reasonCode: string | null | undefined): void {
+  const normalizedReason = String(reasonCode || "").trim().toLowerCase();
+  if (!normalizedReason) return;
+  stats.reasonCounts[normalizedReason] = (stats.reasonCounts[normalizedReason] || 0) + 1;
+}
+
 async function fetchPreviewProductForQueue(
   req: NextRequest,
   pid: string
-): Promise<{ product: any; source: string } | null> {
+): Promise<QueuePreviewFetchResult> {
   const normalizedPid = String(pid || "").trim();
-  if (!normalizedPid) return null;
+  if (!normalizedPid) {
+    return { ok: false, source: "", reasonCode: "missing_pid" };
+  }
 
   const origin = req.nextUrl.origin;
-  if (!origin) return null;
+  if (!origin) {
+    return { ok: false, source: "", reasonCode: "preview_origin_missing" };
+  }
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 3500);
@@ -788,15 +821,36 @@ async function fetchPreviewProductForQueue(
         },
       }
     );
-    if (!res.ok) return null;
-    const payload = await res.json();
-    if (!payload?.ok || !payload?.product) return null;
+    let payload: any = null;
+    try {
+      payload = await res.json();
+    } catch {
+      payload = null;
+    }
+    if (!res.ok) {
+      return {
+        ok: false,
+        source: typeof payload?.source === "string" ? payload.source : "",
+        reasonCode: deriveQueuePreviewUnavailableReason(res.status, payload),
+      };
+    }
+    if (!payload?.ok || !payload?.product) {
+      return {
+        ok: false,
+        source: typeof payload?.source === "string" ? payload.source : "",
+        reasonCode: "preview_invalid_payload",
+      };
+    }
     return {
+      ok: true,
       product: payload.product,
       source: typeof payload?.source === "string" ? payload.source : "unknown",
     };
-  } catch {
-    return null;
+  } catch (error: any) {
+    const reasonCode = String(error?.name || "").trim() === "AbortError"
+      ? "preview_timeout"
+      : "preview_fetch_error";
+    return { ok: false, source: "", reasonCode };
   } finally {
     clearTimeout(timeout);
   }
@@ -813,6 +867,7 @@ type QueueEnrichmentStats = {
   mergedRows: number;
   persistedRows: number;
   persistFailures: number;
+  reasonCounts: Record<string, number>;
 };
 
 type QueueEnrichmentOptions = {
@@ -839,6 +894,7 @@ async function enrichQueueRowsWithStats(
     mergedRows: 0,
     persistedRows: 0,
     persistFailures: 0,
+    reasonCounts: {},
   };
 
   const staleIndexes = normalizedProducts.reduce<number[]>((out, product, index) => {
@@ -878,14 +934,16 @@ async function enrichQueueRowsWithStats(
             persisted: false,
             persistFailed: markerPersistFailed,
             blockedUnavailable: shouldEnforceBlockedUnavailable,
+            reasonCode: "missing_pid",
           } as const;
         }
 
         const previewResult = await fetchPreviewProductForQueue(req, pid);
-        if (!previewResult) {
+        if (!previewResult.ok) {
+          const reasonCode = previewResult.reasonCode || "preview_unavailable";
           let markerPersistFailed = false;
           if (shouldPersist && shouldEnforceBlockedUnavailable) {
-            const marker = await persistQueueLiveSyncBlockedMarker(supabase, currentRaw, pid, "preview_unavailable");
+            const marker = await persistQueueLiveSyncBlockedMarker(supabase, currentRaw, pid, reasonCode);
             markerPersistFailed = marker.failed;
           }
           return {
@@ -894,15 +952,16 @@ async function enrichQueueRowsWithStats(
             persisted: false,
             persistFailed: markerPersistFailed,
             blockedUnavailable: shouldEnforceBlockedUnavailable,
+            reasonCode,
           } as const;
         }
 
         if (!isLivePreviewSource(previewResult.source)) {
+          const reasonCode = previewResult.source === "queue_snapshot"
+            ? "snapshot_source"
+            : "non_live_source";
           let markerPersistFailed = false;
           if (shouldPersist && shouldEnforceBlockedUnavailable) {
-            const reasonCode = previewResult.source === "queue_snapshot"
-              ? "snapshot_source"
-              : "non_live_source";
             const marker = await persistQueueLiveSyncBlockedMarker(supabase, currentRaw, pid, reasonCode);
             markerPersistFailed = marker.failed;
           }
@@ -912,6 +971,7 @@ async function enrichQueueRowsWithStats(
             persisted: false,
             persistFailed: markerPersistFailed,
             blockedUnavailable: shouldEnforceBlockedUnavailable,
+            reasonCode,
           } as const;
         }
 
@@ -957,6 +1017,7 @@ async function enrichQueueRowsWithStats(
           persisted,
           persistFailed,
           blockedUnavailable: false,
+          reasonCode: null,
           index,
           mergedProduct,
         } as const;
@@ -972,6 +1033,9 @@ async function enrichQueueRowsWithStats(
         stats.snapshotHitsSkipped += 1;
       } else {
         stats.previewMisses += 1;
+      }
+      if ("reasonCode" in result) {
+        incrementQueueReasonCount(stats, result.reasonCode);
       }
       if (result.blockedUnavailable) stats.blockedUnavailableRows += 1;
       if (result.merged) stats.mergedRows += 1;
@@ -1211,6 +1275,7 @@ export async function PATCH(req: NextRequest) {
           previewMisses: result.stats.previewMisses,
           blockedUnavailable: result.stats.blockedUnavailableRows,
           persistFailures: result.stats.persistFailures,
+          reasonCounts: result.stats.reasonCounts,
         });
       } catch (backfillError: any) {
         console.error("[Queue PATCH] Backfill error:", backfillError);
